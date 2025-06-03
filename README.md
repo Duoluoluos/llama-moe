@@ -1,4 +1,4 @@
-<div align="center">
+<!-- <div align="center">
   <h1>LLaMA-MoE: Building Mixture-of-Experts from LLaMA with Continual Pre-training</h1>
   <img src="docs/imgs/title-favicon.png" width="200" alt="LLaMA-MoE favicon" style="border-radius: 5%;"><br />
   <span style="color:red">📢 <strong><i>A SMALLER AFFORDABLE MoE MODEL FOR EVERYONE!!</i></strong></span>
@@ -60,29 +60,19 @@ inputs = inputs.to("cuda:0")
 pred = model.generate(**inputs, max_length=50, temperature=0.0)
 print(tokenizer.decode(pred.cpu()[0], skip_special_tokens=True))
 # Suzhou is famous of its beautiful gardens. The most famous one is the Humble Administrator's Garden. It is a classical Chinese garden with a history of more than 600 years. The garden is divided into three
-```
+``` -->
 
 <h2 id="installation">⚙️ Installation</h2>
 
 1. Prepare conda environment: `conda create -n smoe python=3.11` (If your environment name is not `smoe`, you may need to change environment in launching scripts)
-2. Add correct environment variables in `~/.bashrc` (`gcc` is set to newer version for installing `flash-attn`). e.g.:
-    ```bash
-    export PATH=/mnt/petrelfs/share/cuda-11.8/bin:$PATH
-    export LD_LIBRARY_PATH=/mnt/petrelfs/share/cuda-11.8/lib64:$LD_LIBRARY_PATH
-    export PATH=/mnt/petrelfs/share/gcc-10.1.0/bin:$PATH
-    export LD_LIBRARY_PATH=/mnt/petrelfs/share/gcc-10.1.0/lib64:$LD_LIBRARY_PATH
-    ```
-3. Take the variables into effect: `source ~/.bashrc`
-4. Install PyTorch (CUDA-11.8): `pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118`
-5. Install dependencies: `pip install -r requirements.txt`
-6. Install `flash-attn`: `pip install flash-attn==2.0.1 --no-build-isolation`. You may need to follow the [flash-attn installation instructions](https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#installation-and-features) to avoid some errors.
-7. Install the latest Git: `conda install git`
-8. Clone the repo: `git clone git@github.com:pjlab-sys4nlp/llama-moe.git` (If you don't setup the ssh key to GitHub, you may not able to clone through ssh. Check the [docs](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/adding-a-new-ssh-key-to-your-github-account) about it.)
-9. Change current directory: `cd llama-moe`
-10. Install `smoe` in [editable mode](https://pip.pypa.io/en/stable/cli/pip_install/#cmdoption-e): `pip install -e .[dev]`
-11. Setup `pre-commit` hooks: `pre-commit install`
 
-<h2 id="performance">📊 Model Performance</h2>
+3. Take the variables into effect: `source ~/.bashrc`
+4. Install PyTorch : `pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126`
+5. Install dependencies: `pip install -r requirements.txt`
+6. Install `flash-attn`: `pip install flash-attnxxxxxx.whl`. You may need to follow the [flash-attn installation instructions](https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#installation-and-features) to avoid some errors.
+
+
+<!-- <h2 id="performance">📊 Model Performance</h2>
 
 | Model                     | \#Activated Experts | \#Experts | \#Activated Params |                         Foundation Model                          |                              SFT Model                               |
 | :------------------------ | :-----------------: | :-------: | :----------------: | :---------------------------------------------------------------: | :------------------------------------------------------------------: |
@@ -111,7 +101,7 @@ print(tokenizer.decode(pred.cpu()[0], skip_special_tokens=True))
 | Sheared LLaMA-2.7B Deita6K (Our Impl.) | 25.24 | 43.69 |   71.70   |   49.00    |   4.06   |
 | LLaMA-MoE-v1-3.0B (2/16)               | 23.61 | 43.43 |   72.28   |   44.24    |   4.15   |
 | LLaMA-MoE-v1-3.5B (4/16)               | 26.49 | 48.29 |   75.10   |   45.91    |   4.60   |
-| LLaMA-MoE-v1-3.5B (2/8)                | 25.53 | 45.99 |   74.95   |   44.39    |   4.72   |
+| LLaMA-MoE-v1-3.5B (2/8)                | 25.53 | 45.99 |   74.95   |   44.39    |   4.72   | -->
 
 <h2 id="expert-construction">🚧 Expert Construction</h2>
 
@@ -168,7 +158,7 @@ python -m smoe.utils.tokenize \
 We provide simple examples of SFT to build chatbots.
 Please refer to [SFT docs](/mnt/petrelfs/zhutong/smoe/docs/supervised_fine_tuning/SFT.md) and `/mnt/petrelfs/zhutong/smoe/scripts/sft` for more details.
 
-<h2 id="citation">📑 Citation</h2>
+<!-- <h2 id="citation">📑 Citation</h2>
 
 ```bibtex
 @article{llama-moe,
@@ -181,4 +171,4 @@ Please refer to [SFT docs](/mnt/petrelfs/zhutong/smoe/docs/supervised_fine_tunin
 ```
 
 <hr>
-<p align="center">LLaMA-MoE Team w/ ❤️</p>
+<p align="center">LLaMA-MoE Team w/ ❤️</p> -->
