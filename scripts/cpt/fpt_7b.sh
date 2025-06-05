@@ -158,14 +158,3 @@ source ~/anaconda3/bin/activate llama-moe
     --calculator_type "UniversalCalculator" \
     --num_selects ${num_selects}
 }
-#SBATCH --job-name=cpt-moe-fpt-test_lr_change
-#改动前：--logging_steps 10 \
-#改动后：--logging_steps 1 \
-#改动前：没有--resume_from_checkpoint outputs/cpt-moe-fpt-test_lr_change-1700831/checkpoint-10
-#改动后：有--resume_from_checkpoint outputs/cpt-moe-fpt-test_lr_change-1700831/checkpoint-10
-#改动前：max_steps=$(echo "10^11 / ($block_size * $per_device_train_batch_size * $gradient_accumulation_steps * $num_nodes * $num_gpu_per_node)" | bc)
-#改动后：max_steps=20
-#改动前：output_dir=outputs/$SLURM_JOB_NAME-$SLURM_JOB_ID
-#改动后：output_dir=outputs/cpt-moe-fpt-test_lr_change-1700831
-#改动前：--save_steps 1000 \
-#改动后：--save_steps 10 \1
