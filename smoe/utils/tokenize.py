@@ -99,6 +99,7 @@ def prepare_meta(jsonl_filepath: str):
 def tokenize_jsonl():
     args = get_parser()
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=args.use_fast)
+    print(args.tokenizer)
     if args.src_tokenizer is not None:
         src_tokenizer = AutoTokenizer.from_pretrained(
             args.src_tokenizer, use_fast=args.use_fast
@@ -168,6 +169,7 @@ def tokenize_jsonl():
         pbar.write(f"Processing: {input_file} -> {output_file}")
         _tokenize_and_dump(input_file, output_file)
         pbar.write(f"Finished: {input_file} -> {output_file}")
+        break
 
 
 def update_meta_without_tokenization(data_dir: str):

@@ -14,7 +14,10 @@ from packaging import version
 
 # Integrations must be imported before ML frameworks:
 # isort: off
-from transformers.integrations import hp_params, is_fairscale_available
+from transformers.integrations import hp_params
+
+import importlib.util
+is_fairscale_available = lambda: importlib.util.find_spec("fairscale") is not None
 
 # isort: on
 
@@ -27,7 +30,7 @@ from torch.utils.data import DataLoader
 
 # from torch.profiler import profile, schedule, tensorboard_trace_handler, ProfilerActivity
 from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
-from transformers.deepspeed import deepspeed_init
+from transformers.integrations.deepspeed import deepspeed_init
 from transformers.dependency_versions_check import dep_version_check
 from transformers.modeling_utils import unwrap_model
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
@@ -37,7 +40,6 @@ from transformers.trainer_callback import TrainerState
 from transformers.trainer_pt_utils import get_model_param_count, get_parameter_names
 from transformers.trainer_utils import (
     HPSearchBackend,
-    ShardedDDPOption,
     TrainOutput,
     has_length,
     seed_worker,
@@ -85,11 +87,11 @@ if is_accelerate_available():
 
 
 if is_fairscale_available():
-    dep_version_check("fairscale")
     from fairscale.optim import OSS
 
 
 logger = logging.get_logger(__name__)
+
 
 
 def deepspeed_load_checkpoint(
@@ -201,37 +203,30 @@ class LlamaLrSchedulingTrainer(Trainer):
                 self.args
             )
 
-            if self.sharded_ddp == ShardedDDPOption.SIMPLE:
-                self.optimizer = OSS(
-                    params=optimizer_grouped_parameters,
-                    optim=optimizer_cls,
-                    **optimizer_kwargs,
-                )
-            else:
-                self.optimizer = optimizer_cls(
-                    optimizer_grouped_parameters, **optimizer_kwargs
-                )
-                if optimizer_cls.__name__ == "Adam8bit":
-                    import bitsandbytes
+            self.optimizer = optimizer_cls(
+                optimizer_grouped_parameters, **optimizer_kwargs
+            )
+            if optimizer_cls.__name__ == "Adam8bit":
+                import bitsandbytes
 
-                    manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+                manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
 
-                    skipped = 0
-                    for module in opt_model.modules():
-                        if isinstance(module, nn.Embedding):
-                            skipped += sum(
-                                {
-                                    p.data_ptr(): p.numel() for p in module.parameters()
-                                }.values()
-                            )
-                            logger.info(f"skipped {module}: {skipped/2**20}M params")
-                            manager.register_module_override(
-                                module, "weight", {"optim_bits": 32}
-                            )
-                            logger.debug(
-                                f"bitsandbytes: will optimize {module} in fp32"
-                            )
-                    logger.info(f"skipped: {skipped/2**20}M params")
+                skipped = 0
+                for module in opt_model.modules():
+                    if isinstance(module, nn.Embedding):
+                        skipped += sum(
+                            {
+                                p.data_ptr(): p.numel() for p in module.parameters()
+                            }.values()
+                        )
+                        logger.info(f"skipped {module}: {skipped/2**20}M params")
+                        manager.register_module_override(
+                            module, "weight", {"optim_bits": 32}
+                        )
+                        logger.debug(
+                            f"bitsandbytes: will optimize {module} in fp32"
+                        )
+                logger.info(f"skipped: {skipped/2**20}M params")
 
         if is_sagemaker_mp_enabled():
             self.optimizer = smp.DistributedOptimizer(self.optimizer)
@@ -605,12 +600,13 @@ class LlamaLrSchedulingTrainer(Trainer):
             else:
                 debug_overflow = DebugUnderflowOverflow(self.model)  # noqa
 
-        delay_optimizer_creation = (
-            self.sharded_ddp is not None
-            and self.sharded_ddp != ShardedDDPOption.SIMPLE
-            or is_sagemaker_mp_enabled()
-            or self.fsdp is not None
-        )
+        delay_optimizer_creation = False
+        # delay_optimizer_creation = (
+        #     self.sharded_ddp is not None
+        #     and self.sharded_ddp != ShardedDDPPlugin.SIMPLE
+        #     or is_sagemaker_mp_enabled()
+        #     or self.fsdp is not None
+        # )
 
         # We need to reset the scheduler, as its parameters may be different on subsequent calls
         if self._created_lr_scheduler:
@@ -631,8 +627,8 @@ class LlamaLrSchedulingTrainer(Trainer):
         self.state.is_hyper_param_search = trial is not None
 
         # Activate gradient checkpointing if needed
-        if args.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable()
+        # if args.gradient_checkpointing:
+        #     self.model.gradient_checkpointing_enable()
 
         model = self._wrap_model(self.model_wrapped)
 
@@ -797,7 +793,7 @@ class LlamaLrSchedulingTrainer(Trainer):
         total_batched_samples = 0
         for epoch in range(epochs_trained, num_train_epochs):
             epoch_iterator = train_dataloader
-
+            logger.info("dataloader length:", len(epoch_iterator))
             # Reset the past mems state at the beginning of each epoch if necessary.
             if args.past_index >= 0:
                 self._past = None
@@ -828,20 +824,11 @@ class LlamaLrSchedulingTrainer(Trainer):
                 steps_trained_in_current_epoch = 0
                 rng_to_sync = True
 
-            # tracing_schedule = schedule(skip_first=5, wait=5, warmup=2, active=2, repeat=1)
-            # trace_handler = tensorboard_trace_handler(dir_name="/mnt/petrelfs/zhutong/smoe/results/profiling", use_gzip=True)
-
-            # with profile(
-            #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            #     schedule=tracing_schedule,
-            #     on_trace_ready=trace_handler,
-            #     profile_memory=True,
-            #     record_shapes=True,
-            #     with_stack=True
-            # ) as prof:
-
             step = -1
             for step, inputs in enumerate(epoch_iterator):
+                if not inputs:  # 检查空数据
+                    logger.error("Empty batch detected at step %d. Skipping...", step)
+                    continue
                 total_batched_samples += 1
                 if rng_to_sync:
                     self._load_rng_state(resume_from_checkpoint)

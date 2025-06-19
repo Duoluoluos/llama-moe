@@ -1,6 +1,11 @@
 import numpy as np
 import torch
 
+TOY_DATA = {
+    "code_tokenized": 1
+}
+
+
 LLAMA_DATA_PORTION = {
     "en_cc": 0.67,
     "en_c4": 0.15,

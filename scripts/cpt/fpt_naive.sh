@@ -1,12 +1,10 @@
 #!/usr/bin/bash
 
 # 激活Python环境
-source ~/anaconda3/bin/activate llama-moe
-
 {
   # 手动配置节点参数（原SLURM参数）
-  num_nodes=2          # 总节点数
-  num_gpu_per_node=8   # 每节点GPU数
+  num_nodes=1          # 总节点数
+  num_gpu_per_node=7   # 每节点GPU数
   job_name="cpt-v2-7b" # 任务名称
 
   # 环境变量配置
@@ -16,11 +14,12 @@ source ~/anaconda3/bin/activate llama-moe
 
   ##############################################################
   ### 模型/训练参数配置（保留原配置）###
+  train_script="/home/wangqi/llama-moe/smoe/entrypoint/cpt/cpt_fpt.py"
   model_type="llama_moe"
-  tokenizer_path=/mnt/petrelfs/share_data/quxiaoye/models/llama_7B
-  dataset_dir=/mnt/petrelfs/share_data/quxiaoye/SlimPajama_processed
-  validation_dir=/mnt/petrelfs/share_data/quxiaoye/data/llama1_7B_val_set_tokenized
-  pretrained_model=/mnt/petrelfs/share_data/quxiaoye/models/LlamaMoEForCausalLM/... # 填写实际路径
+  tokenizer_path=/data/wangqi/models/Qwen2.5-7B-Instruct
+  dataset_dir=/data/wangqi/code_tokenized
+  validation_dir=/data/wangqi/code_val
+  pretrained_model=/data/wangqi/models/Qwen2.5-7B-Instruct
   
   lr=3e-4
   final_lr_portion=0.1
@@ -28,7 +27,8 @@ source ~/anaconda3/bin/activate llama-moe
   per_device_eval_batch_size=8
   gradient_accumulation_steps=4
   block_size=4096
-  num_tokens="1 * 10^11"
+  # 注意：需要设置训练数据量（单位：tokens）
+  num_tokens="100000"
   seed=1227
   deepspeed_config_file=conf/deepspeed/bf16_zero1_default.json
   num_selects=4
@@ -59,7 +59,7 @@ source ~/anaconda3/bin/activate llama-moe
   # 节点配置（需手动设置）[6,7](@ref)
   ##############################################################
   ### 重要：需根据实际环境修改以下参数 ###
-  master_addr="主节点IP"          # 替换为头节点IP
+  master_addr="127.0.0.1"          # 替换为头节点IP
   master_port=29518              # 可自定义端口
   node_rank=0                    # 当前节点排名(0-indexed)
   ##############################################################
@@ -76,7 +76,7 @@ source ~/anaconda3/bin/activate llama-moe
     --rdzv_id $RANDOM \
     --rdzv_backend c10d \
     --rdzv_endpoint $master_addr:$master_port \
-    smoe/entrypoint/cpt/cpt_fpt.py \
+    "$train_script" \  
     --deepspeed ${deepspeed_config_file} \
     --model_name_or_path ${pretrained_model} \
     --model_type ${model_type} \

@@ -20,7 +20,7 @@ def delete_file_or_dir(dir):
 
 def torch_load_template_file(path, template, layer):
     target = os.path.join(path, template.format(layer))
-    return torch.load(target)
+    return torch.load(target,weights_only=False)
 
 
 def torch_load_template_score_file(path, template, layer):

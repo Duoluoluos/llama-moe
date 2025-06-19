@@ -8,7 +8,10 @@ from transformers.utils import ModelOutput
 
 from smoe.modules.moe.moe_experts import LinearGLUExperts
 from smoe.modules.norm import WeightNorm
-from smoe.utils.debugging import remote_breakpoint
+from smoe.utils.debugging import remote_breakpoint, assert_finite
+from smoe.utils.safe_cal import _safe_reset, _safe_forward
+LinearGLUExperts.reset_parameters = _safe_reset
+LinearGLUExperts.forward          = _safe_forward
 
 
 @dataclass
@@ -37,10 +40,16 @@ class UniformCalculator(BaseCalculator):
 
     def forward(self, x, topK_scores, **kwargs) -> CalculatorOutput:
         # num_selects * (bsz*seq_len, hidden_size)
-        expert_outputs = [self.experts(x, i) for i in range(self.num_experts)]
+        assert_finite("calc_input_x", x)
+        expert_outputs = []
+        for i in range(self.num_experts):
+            eo = self.experts(x, i)
+            assert_finite(f"expert_{i}_out", eo)      # <2> 每个专家输出
+            expert_outputs.append(eo)
 
         # (num_selects, bsz*seq_len, hidden_size)
         stack_expert_outputs = torch.stack(expert_outputs, 0)  # 拼接专家输出
+        assert_finite(f"stacked_out", stack_expert_outputs)
         if self.multiply_gate_scores:
             expanded_socre = (
                 topK_scores.transpose(0, 1)
@@ -114,24 +123,33 @@ class UniversalCalculator(BaseCalculator):
         """对每个专家重新组合batch"""
         sorted_x = x.index_select(0, sorted_batch_indices)  # 将输入按照排序后的batch编号，重新编制
         split_x = torch.split(sorted_x, expert_batch_size, dim=0)  # 按照排序后每个专家的batch_size进行分隔，恰好得到各个专家所需的batch
-
+        expert_outputs = []
+        for i in range(self.num_experts):
+            if split_x[i].shape[0] == 0:
+                continue
+            eo = self.experts(split_x[i], i)
+            assert_finite(f"expert_{i}_out", eo)      # <2> 每个专家输出
+            expert_outputs.append(eo)
         """各专家分别正向传播"""  # 此处应该有并行优化的空间 (如果单次forward不足以占满显卡利用率)
         # args = [(split_x[i], i) for i in range(self.num_experts) if split_x[i].shape[0] > 0]
         # expert_outputs = self.experts_vmap(args)
-        expert_outputs = [self.experts(split_x[i], i) for i in range(self.num_experts) if split_x[i].shape[0] > 0]
+        # expert_outputs = [self.experts(split_x[i], i) for i in range(self.num_experts) if split_x[i].shape[0] > 0]
 
         """重组各个专家的输出，并进行加权"""
         # (bsz*seq_len*num_selects, hidden_size)
         cat_expert_outputs = torch.cat(expert_outputs, 0)  # 拼接专家输出
+        assert_finite(f"cat_expert_outputs", cat_expert_outputs) 
         output_dim = cat_expert_outputs.size(1)
         if self.multiply_gate_scores:
             if self.mlp_norm is None:
                 cat_expert_outputs = torch.mul(cat_expert_outputs, sorted_topK_scores.reshape(-1, 1) * self.score_scale_factor)  # 乘权重
+                assert_finite(f"cat_expert_outputs_mul", cat_expert_outputs) 
                 # cat_expert_outputs = torch.mul(cat_expert_outputs, sorted_topK_scores.reshape(-1, 1) * 1.0)  # 乘权重
             else:
                 cat_expert_outputs = torch.mul(cat_expert_outputs, sorted_topK_scores.reshape(-1, 1))  # 乘权重
+                assert_finite(f"cat_expert_outputs_mul", cat_expert_outputs) 
                 cat_expert_outputs = self.mlp_norm(cat_expert_outputs)
-
+                assert_finite(f"cat_expert_outputs_mlp_norm", cat_expert_outputs) 
         zeros = torch.zeros((batch_size, output_dim), device=cat_expert_outputs.device, dtype=cat_expert_outputs.dtype)
         y = zeros.index_add(0, sorted_batch_indices, cat_expert_outputs)  # 按照对应的batch编号，添加输出
 
@@ -213,7 +231,9 @@ class SwitchDropTokenCalculator(BaseCalculator):
 
             if num_assigned_tokens > 0:
                 expert_output = self.experts(x[token_indices, :], i)
+                assert_finite(f"expert_output", expert_output) 
                 y[token_indices, :] = expert_output
+
 
         if self.dropped_padding == "input" and len(dropped_indices) > 0:
             dropped_indices = torch.cat(dropped_indices, dim=0)

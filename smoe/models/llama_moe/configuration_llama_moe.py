@@ -93,6 +93,7 @@ class LlamaMoEConfig(PretrainedConfig):
             num_key_value_heads = num_attention_heads
 
         self.num_key_value_heads = num_key_value_heads
+        self.mlp_bias = kwargs.get("mlp_bias", False)  # 默认关闭偏置
 
         super().__init__(
             pad_token_id=pad_token_id,

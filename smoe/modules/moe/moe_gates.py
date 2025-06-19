@@ -316,8 +316,15 @@ class TopKBalancedNoisyGate(BaseGate):
                 threshold_positions_if_out = threshold_positions_if_in - 1
                 threshold_if_out = torch.unsqueeze(torch.gather(top_values_flat, 0, threshold_positions_if_out), 1)
                 # is each value currently in the top k.
-                prob_if_in = self.normal.cdf((logits_gate - threshold_if_in) / noise_control)
-                prob_if_out = self.normal.cdf((logits_gate - threshold_if_out) / noise_control)
+                logits_fp32 = logits_gate.float()
+                thresh_fp32_in = threshold_if_in.float()
+                noise_fp32  = noise_control.float().clamp(min=1e-6)  # 避免除 0
+                prob_if_in  = self.normal.cdf((logits_fp32 - thresh_fp32_in) / noise_fp32)
+                prob_if_in  = prob_if_in.type_as(logits_gate)         # cast 回原 dtype                prob_if_out = self.normal.cdf((logits_gate - threshold_if_out) / noise_control)
+
+                thresh_fp32_out = threshold_if_out.float()
+                prob_if_out = self.normal.cdf((logits_fp32 - thresh_fp32_out) / noise_fp32)
+                prob_if_out  = prob_if_out.type_as(logits_gate) 
                 prob = torch.where(is_in, prob_if_in, prob_if_out)
                 load = prob.sum(0)
             else:

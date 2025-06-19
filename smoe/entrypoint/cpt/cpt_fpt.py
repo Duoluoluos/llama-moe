@@ -3,9 +3,12 @@ import os
 import socket
 import sys
 from pathlib import Path
-
+import torch.distributed as dist
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 import datasets
 import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 import transformers
 from transformers import (
     CONFIG_MAPPING,
@@ -15,11 +18,10 @@ from transformers import (
     LlamaConfig,
     LlamaForCausalLM,
     LlamaTokenizer,
-    is_torch_tpu_available,
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
-
+sys.path.append('.')
 from smoe.callbacks.save_model import SchedulerStateCallback
 from smoe.callbacks.tensorboard import EnhancedTensorboardCallback
 from smoe.data.collate_fn import fault_tolerance_data_collator
@@ -27,8 +29,9 @@ from smoe.data.dynamic_selection import (
     AVERAGE_SLIMPAJAMA_DATA_PORTION,
     LLAMA_DATA_PORTION,
     SHEAREDLLAMA_DATA_PORTION,
+    TOY_DATA
 )
-from smoe.data.streaming import CachedJsonlDataset, SubDirWeightedPackedJsonlDataset
+from smoe.data.streaming import CachedJsonlDataset, SubDirWeightedPackedJsonlDataset, PackedJsonlDataset
 from smoe.metrics.preprocess import logits_argmax
 from smoe.models.llama_moe.configuration_llama_moe import LlamaMoEConfig
 from smoe.models.llama_moe.modeling_llama_moe import LlamaMoEForCausalLM
@@ -71,10 +74,19 @@ logger = logging.getLogger(__name__)
 
 # @wechat_sender(msg_prefix="CPT Training")
 def main():
+    dist.init_process_group(
+        backend="nccl",  
+        init_method="env://",  
+        world_size=int(os.environ.get("WORLD_SIZE", 1)),  
+        rank=int(os.environ.get("RANK", 0))  
+    )
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+    
     model_args, data_args, training_args = parse_args(
         ModelArguments, DataArguments, EnhancedTrainingArguments
     )
-
     # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -103,9 +115,9 @@ def main():
         f"fp16 training: {training_args.fp16}, "
         f"bf16 training: {training_args.bf16}"
     )
-    logger.info(f"Model args: {model_args}")
-    logger.info(f"Data args: {data_args}")
-    logger.info(f"Training args: {training_args.to_json_string()}")
+    # logger.info(f"Model args: {model_args}")
+    # logger.info(f"Data args: {data_args}")
+    # logger.info(f"Training args: {training_args.to_json_string()}")
 
     if training_args.debug_mode:
         from smoe.utils.debugging import remote_breakpoint
@@ -197,9 +209,7 @@ def main():
             model_args.tokenizer_name, **tokenizer_kwargs
         )
     elif model_args.tokenizer_name_or_path:
-        tokenizer = LlamaTokenizer.from_pretrained(
-            model_args.tokenizer_name_or_path, **tokenizer_kwargs
-        )
+        tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name_or_path, use_fast=True)
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported"
@@ -227,16 +237,15 @@ def main():
             )
         block_size = min(data_args.block_size, tokenizer.model_max_length)
 
-    prob_map = LLAMA_DATA_PORTION
-    if data_args.prob_map == "uniform":
-        prob_map = AVERAGE_SLIMPAJAMA_DATA_PORTION
-    elif data_args.prob_map == "sheared_llama":
-        prob_map = SHEAREDLLAMA_DATA_PORTION
+    prob_map = TOY_DATA
+    # if data_args.prob_map == "uniform":
+    #     prob_map = AVERAGE_SLIMPAJAMA_DATA_PORTION
+    # elif data_args.prob_map == "sheared_llama":
+    #     prob_map = SHEAREDLLAMA_DATA_PORTION
 
     with training_args.main_process_first(desc="dataset map tokenization and grouping"):
-        lm_datasets = SubDirWeightedPackedJsonlDataset(
+        lm_datasets = PackedJsonlDataset(
             data_args.dataset_dir,
-            prob_map=prob_map,
             seed=training_args.seed,
             block_size=data_args.block_size,
         )
@@ -258,10 +267,11 @@ def main():
             res = tokenizer.decode([x["input_ids"] for x in train_dataset.take(1)][0])
         else:
             for x in train_dataset:
+                #logger.info(x)
                 input_ids = x["input_ids"]
                 break
             res = tokenizer.decode(input_ids)
-        logger.info(res)
+        #logger.info(f"example res:{res}")
 
     eval_dataset = None
     if training_args.do_eval:
@@ -272,7 +282,7 @@ def main():
             )
             for path in paths
         }
-        logger.info(f"eval types: {list(eval_dataset.keys())}")
+        #logger.info(f"eval types: {list(eval_dataset.keys())}")
 
     if model_args.model_name_or_path:
         torch_dtype = (
@@ -289,40 +299,36 @@ def main():
         if isinstance(config, MixtralConfig):
             config._attn_implementation = "flash_attention_2"
 
-        model: LlamaForCausalLM | LlamaMoEForCausalLM | LlamaMoEResidualForCausalLM | MixtralForCausalLM = ModelClass.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
+        # model: LlamaForCausalLM | LlamaMoEForCausalLM | LlamaMoEResidualForCausalLM | MixtralForCausalLM = ModelClass.from_pretrained(
+        #     model_args.model_name_or_path,
+        #     from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        #     config=config,
+        #     cache_dir=model_args.cache_dir,
+        #     revision=model_args.model_revision,
+        #     use_auth_token=True if model_args.use_auth_token else None,
+        #     torch_dtype=torch_dtype,
+        #     low_cpu_mem_usage=True,
+        # )
+        with init_empty_weights():
+            model = ModelClass(config)  
+        model = load_checkpoint_and_dispatch(
+            model,
+            checkpoint=model_args.model_name_or_path,
+            device_map={"": device.index},          # 每个 rank 放到自己那张卡
+            dtype=torch_dtype,
+            no_split_module_classes=[
+                "LlamaDecoderLayer", "LlamaMoEDecoderLayer"
+            ],
         )
 
-        # train an MoE model from scratch 👇
-        # config.num_hidden_layers = 20
-        # model: LlamaMoEForCausalLM = LlamaMoEForCausalLM(config)
-        # if isinstance(model, LlamaMoEForCausalLM):
-        #     for name, param in model.named_parameters():
-        #         if "weight_noise.weight" in name:
-        #             nn.init.zeros_(param)
-        #     model.change_moe_gate_add_noise(True)
-        #     model.change_moe_gate_use_balance(True)
-        # model.reset_gate_network()
-        replace_xformers(model)
+
     else:
         model = AutoModelForCausalLM.from_config(config)
         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
         logger.info(
             f"Training new model from scratch - Total size={n_params / 2 ** 20:.2f}M params"
         )
-
-    # for name, param in model.named_parameters():
-    #     # if ".mlp_norm." not in name:
-    #     if ".gate." not in name and ".mlp_norm." not in name:
-    #         param.requires_grad = False
-    #     logger.info(f"{name} ({param.numel()}) - Grad: {param.requires_grad}")
+    logger.info(f'Params:{model.named_parameters()}')
 
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
@@ -333,23 +339,12 @@ def main():
 
         model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    # if hasattr(model, "set_moe_calculator_score_scale_factor"):
-    #     # update config for checkpoint retrival
-    #     # model.set_moe_gate_balance_loss_weight(0.1)
-    #     # model.set_moe_calculator_score_scale_factor(4.0)
-    #     model.set_moe_calculator_score_scale_factor(
-    #         model_args.moe_calculator_score_scale_factor
-    #     )
-    #     # model.set_moe_calculator_score_scale_factor(1.0)
-    #     model.update_config()
 
     model_vocab_size = model.get_output_embeddings().weight.size(0)
-    if model_vocab_size != len(tokenizer):
-        model.resize_token_embeddings(len(tokenizer))
-        raise ValueError(
-            f"The model's vocab size ({model_vocab_size}) does not match with the"
-            f" tokenizer ({len(tokenizer)})"
-        )
+
+    # Set
+    model = DDP(model, device_ids=[device], output_device=device, find_unused_parameters=False)
+
 
     trainable_params, _ = get_trainable_parameters(model, verbose=True)
     training_args.num_training_params = trainable_params
@@ -365,7 +360,7 @@ def main():
         compute_metrics=None,
         preprocess_logits_for_metrics=(
             logits_argmax
-            if training_args.do_eval and not is_torch_tpu_available()
+            if training_args.do_eval
             else None
         ),
     )
@@ -378,6 +373,7 @@ def main():
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
+
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
 
         metrics = train_result.metrics
@@ -401,7 +397,9 @@ def main():
         else:
             metrics = trainer.evaluate(ignore_keys=None)
         logger.info(f"{metrics}")
-
+    
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

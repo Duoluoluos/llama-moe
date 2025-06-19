@@ -1,5 +1,5 @@
 import socket
-
+import torch
 import debugpy
 import torch.distributed as dist
 
@@ -58,3 +58,18 @@ def remote_breakpoint(host: str = "0.0.0.0", port: int = 5678, rank: int = 0):
         dist.barrier()
     else:
         _dp()
+
+
+def assert_finite(name: str, tensor: torch.Tensor):
+    if not torch.isfinite(tensor).all():
+        # 只打印/保存前几个异常元素，避免刷屏
+        bad_mask = ~torch.isfinite(tensor)
+        bad_vals = tensor[bad_mask][:8].detach().cpu()
+        print(f"[NaN/Inf DETECTED] {name}: {bad_vals}")
+        # 保存以便事后分析
+        torch.save(tensor.detach().cpu(), f"/tmp/{name}_nan.pt")
+        raise RuntimeError(f"Abort training: {name} contains NaN/Inf.")
+    
+def value_print(name, tensor: torch.Tensor):
+    vals = tensor[:8].detach().cpu()
+    print(f"[{name}] {vals}")

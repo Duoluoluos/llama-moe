@@ -21,6 +21,7 @@ from .moe_gates import (
     UniformLearnableGate,
     UniformPlainGate,
 )
+from smoe.utils.debugging import assert_finite
 
 
 @dataclass
@@ -140,13 +141,20 @@ class BaseMoELayer(nn.Module):
         original_shape = x.shape[:-1]
         x = x.reshape(-1, self.input_size)
         # shape(batch_size*seq_len, input_size)
-
+        assert_finite("moe_input_x", x)
         # 计算被选出的专家及其分数，以及gate的loss
         gate_outputs: dict = self.gate(x)
+        gate_keys = ['topK_indices', 'topK_scores', 'balance_loss', 'load', 'importance']
+        for key in gate_keys:
+            assert_finite(f"gate_out_{key}", gate_outputs[key])
         # 合并各专家的计算结果
         calc_outs: CalculatorOutput = self.calculator(x, **gate_outputs)
+        assert_finite("experts_out", calc_outs.hidden_states)
+
         y = calc_outs.hidden_states
         y = y.reshape(original_shape + (self.output_size,))
+        assert_finite("experts_out_reshape", y)
+
         # shape(batch_size, seq_len, output_size)
 
         return MoEMlpOutput(

@@ -18,14 +18,19 @@ from transformers.models.llama.modeling_llama import (
     LlamaPreTrainedModel,
 )
 from transformers.utils import ModelOutput, logging
-
+from transformers import AutoModelForCausalLM
 from smoe.models.llama_moe.configuration_llama_moe import LlamaMoEConfig
 from smoe.modules.moe.moe_layers import LinearGLUMoELayer, MoEMlpOutput
 from smoe.modules.norm import WeightNorm
+from smoe.utils.debugging import assert_finite
+from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaMoEConfig"
+
+
+
 
 
 @dataclass
@@ -55,7 +60,7 @@ class MoECausalLMOutputWithPast(CausalLMOutputWithPast):
 
 class LlamaMoEDecoderLayer(LlamaDecoderLayer):
     def __init__(self, config: LlamaMoEConfig, layer_index):
-        super().__init__(config)  # layer_index
+        super().__init__(config, layer_index)   
 
         gating_config = {
             # all gates
@@ -112,6 +117,7 @@ class LlamaMoEDecoderLayer(LlamaDecoderLayer):
     ) -> tuple:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        assert_finite("after_ln1", hidden_states)
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -123,12 +129,19 @@ class LlamaMoEDecoderLayer(LlamaDecoderLayer):
             use_cache=use_cache,
         )
         hidden_states = residual + hidden_states
+        assert_finite("after_attn", hidden_states)
 
         # Fully Connected
         residual = hidden_states
+        assert_finite("residual", residual)
+
         hidden_states = self.post_attention_layernorm(hidden_states)
+        assert_finite("post_attn", hidden_states)
         mlp_outs: MoEMlpOutput = self.mlp(hidden_states)
+        #assert_finite("mlp_outs", mlp_outs.hidden_states)
+
         hidden_states = residual + mlp_outs.hidden_states
+        assert_finite("after_residual1", hidden_states)
 
         outputs = (
             hidden_states,
@@ -503,6 +516,13 @@ class LlamaMoEModel(LlamaModel, LlamaMoEPreTrainedModel):
         for idx, decoder_layer in enumerate(self.layers):
             decoder_layer.reset_experts()
 
+    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
+        return _prepare_4d_causal_attention_mask(
+            attention_mask,
+            input_shape,
+            inputs_embeds,
+            past_key_values_length
+        )
 
 class LlamaMoEForCausalLM(LlamaForCausalLM, LlamaMoEPreTrainedModel):
     def __init__(self, config):

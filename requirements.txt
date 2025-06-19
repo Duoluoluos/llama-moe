@@ -32,7 +32,7 @@ xformers
 pebble
 matplotlib
 python-dotenv
-sentence-transformers
+sentence-transformers==2.2.2
 Pillow
 numpy==1.25.0
 opencv-python

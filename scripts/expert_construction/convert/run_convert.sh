@@ -4,16 +4,16 @@
 #  llama2_7B  llama2_13B  llama2_30B  llama2_base
 #  open_llama_7b
 #  ReluLLaMA-7B
-llama_size="ReluLLaMA-7B"
+llama_size="Qwen2.5-7B-Instruct"
 
 num_experts=16           #  4  8  16  32
 num_selects=4            #  1  2  4  8
-split_type=Clustering-l2 #  Graph-l1_norm  Graph-l2_norm  Clustering-l2  Clustering-cos  Random
+split_type=Random #  Graph-l1_norm  Graph-l2_norm  Clustering-l2  Clustering-cos  Random
 proj_type=gate_proj      #  gate_proj  up_proj
 select_type=positive     #  plain  positive  l1_norm  l2_norm
 
-use_random_gate="False" #  True  False
-gate_type="mlp"         #  mlp  linear
+use_random_gate="True" #  True  False
+gate_type="linear"         #  mlp  linear
 use_softmax="False"
 multiply_gate_scores="False"
 
@@ -23,7 +23,7 @@ score_scale_factor_file_path=""
 
 convert_type=LlamaMoEForCausalLM #  LlamaMoEModel  LlamaMoEForCausalLM  LlamaMoEForSequenceClassification
 
-data_path=/mnt/petrelfs/share_data/quxiaoye
+data_path=/data/wangqi
 model_path=${data_path}/models/${llama_size}
 split_file_path=${data_path}/moefication_results/split/${llama_size}-${num_experts}Expert-Split-${split_type}
 
@@ -37,10 +37,8 @@ else
   #  save_path=${data_path}/models/${convert_type}/${split_type}-${select_type}/${llama_size}-${num_experts}Select${num_selects}-${proj_type}
 fi
 
-gpus=0
-cpus=8
-OMP_NUM_THREADS=2 srun --partition=MoE --job-name=convert --mpi=pmi2 --gres=gpu:${gpus} -n1 --ntasks-per-node=1 -c ${cpus} --kill-on-bad-exit=1 --quotatype=auto \
-  python -m smoe.entrypoint.expert_construction.llama_convert \
+
+torchrun --nnodes=1 --nproc_per_node=8 -m smoe.entrypoint.expert_construction.llama_convert \
   --model_path ${model_path} \
   --split_file_path ${split_file_path} \
   --select_file_path "${select_file_path}" \
