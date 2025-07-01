@@ -152,9 +152,11 @@ class EnhancedTrainerState(TrainerState):
 
 
 class LlamaLrSchedulingTrainer(Trainer):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, do_grad_scaling=False, use_apex = False , weighted_ds=False , *args, **kwargs):
         super().__init__(*args, **kwargs)
-
+        self.weighted_ds = weighted_ds
+        self.do_grad_scaling = do_grad_scaling
+        self.use_apex = use_apex
         self.args: EnhancedTrainingArguments
         self.state: EnhancedTrainerState = EnhancedTrainerState(
             is_local_process_zero=self.is_local_process_zero(),
@@ -288,10 +290,8 @@ class LlamaLrSchedulingTrainer(Trainer):
         with self.compute_loss_context_manager():
             # zhutong: return outputs
             loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
-
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
-
         if self.do_grad_scaling:
             self.scaler.scale(loss).backward()
         elif self.use_apex:
@@ -340,7 +340,8 @@ class LlamaLrSchedulingTrainer(Trainer):
             ]
             logs["balance_loss"] = balance_loss.item()
             logs["tot_consumed_tokens"] = self.state.tot_consumed_tokens
-            logs["prob_map"] = self.train_dataset.prob_map
+            if self.weighted_ds:
+                logs["prob_map"] = self.train_dataset.prob_map
 
             self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
@@ -480,16 +481,16 @@ class LlamaLrSchedulingTrainer(Trainer):
             train_dataset = self._remove_unused_columns(
                 train_dataset, description="training"
             )
-        else:
-            data_collator = self._get_collator_with_removed_columns(
-                data_collator, description="training"
-            )
-
+        # else:
+        #     data_collator = self._get_collator_with_removed_columns(
+        #         data_collator, description="training"
+        #     )
         dataloader_params = {
             "batch_size": self._train_batch_size,
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
+            "drop_last": False
         }
 
         if not isinstance(train_dataset, torch.utils.data.IterableDataset):
@@ -791,10 +792,13 @@ class LlamaLrSchedulingTrainer(Trainer):
 
         self.state.start_timestamp = time.time()
         total_batched_samples = 0
+
+        # logger.info(f"Dataset size: {len(self.train_dataset)}")
+        # sample = next(iter(train_dataloader))
+        # logger.info(f"Batch keys: {list(sample.keys())}, shapes: {[v.shape for v in sample.values()]}")
+
         for epoch in range(epochs_trained, num_train_epochs):
-            epoch_iterator = train_dataloader
-            logger.info("dataloader length:", len(epoch_iterator))
-            # Reset the past mems state at the beginning of each epoch if necessary.
+            epoch_iterator = train_dataloader # Reset the past mems state at the beginning of each epoch if necessary.
             if args.past_index >= 0:
                 self._past = None
 
@@ -822,9 +826,10 @@ class LlamaLrSchedulingTrainer(Trainer):
                 )
                 steps_skipped = steps_trained_in_current_epoch
                 steps_trained_in_current_epoch = 0
-                rng_to_sync = True
+                rng_to_sync = True 
 
             step = -1
+            
             for step, inputs in enumerate(epoch_iterator):
                 if not inputs:  # 检查空数据
                     logger.error("Empty batch detected at step %d. Skipping...", step)

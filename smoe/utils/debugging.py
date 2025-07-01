@@ -73,3 +73,20 @@ def assert_finite(name: str, tensor: torch.Tensor):
 def value_print(name, tensor: torch.Tensor):
     vals = tensor[:8].detach().cpu()
     print(f"[{name}] {vals}")
+
+def cast_all_buffers(model, dtype, device=None):
+    """
+    递归把模型里所有 buffer（包括 inv_freq, cos_cached, sin_cached 等）
+    原地转换到目标 dtype/device。
+    不重新 register，直接改 _buffers 字典，规避“名字含点”问题。
+    """
+    for module in model.modules():                    # 遍历包含自身的所有子模块
+        for buf_name, buf in module._buffers.items(): # 直接访问本模块 buffer
+            if buf is not None:
+                module._buffers[buf_name] = buf.to(dtype=dtype, device=device)
+
+        # 特别处理 LlamaRotaryEmbedding 的缓存
+        if hasattr(module, "max_seq_len_cached"):     # LlamaRotaryEmbedding 才有
+            module.cos_cached = None
+            module.sin_cached = None
+            module.max_seq_len_cached = 0

@@ -38,7 +38,7 @@ else
 fi
 
 
-torchrun --nnodes=1 --nproc_per_node=8 -m smoe.entrypoint.expert_construction.llama_convert \
+torchrun --nnodes=1 --nproc_per_node=2 -m smoe.entrypoint.expert_construction.llama_convert \
   --model_path ${model_path} \
   --split_file_path ${split_file_path} \
   --select_file_path "${select_file_path}" \

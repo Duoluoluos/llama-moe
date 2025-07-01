@@ -264,6 +264,7 @@ class PackedJsonlDataset(IterableDataset):
             yield from self.buffer
             self.buffer.clear()
 
+
     def buffer_aggregation(self):
         if self.block_size > 0 and len(self.buffer) > 0:
             results = group_instances(self.buffer, self.block_size)

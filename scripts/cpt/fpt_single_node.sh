@@ -1,15 +1,15 @@
 workdir="/home/wangqi/llama-moe"
 cd $workdir
 # 手动配置节点参数（原SLURM参数）
-num_nodes=1          # 总节点数
+num_nodes=2          # 总节点数
 num_gpu_per_node=8   # 每节点GPU数
 job_name="cpt-v2-7b" # 任务名称
 
 
-export MASTER_ADDR="localhost"
+export MASTER_ADDR="100.64.1.25"
 export MASTER_PORT=12355
 export RANK=0
-export WORLD_SIZE=1
+export WORLD_SIZE=$(($num_nodes * $num_gpu_per_node))
 
 # 环境变量配置
 export OMP_NUM_THUM_THREADS=1
@@ -25,12 +25,12 @@ validation_dir=/data/wangqi/code_val
 pretrained_model=/data/wangqi/models/LlamaMoEForCausalLM/Random/Qwen2.5-7B-Instruct-16Select4-gate_proj-Scale1.0
 lr=3e-6
 final_lr_portion=0.1
-per_device_train_batch_size=2
-per_device_eval_batch_size=2
+per_device_train_batch_size=1
+per_device_eval_batch_size=1
 gradient_accumulation_steps=4
 block_size=4096
 # 注意：需要设置训练数据量（单位：tokens）
-num_tokens="50000000000"
+num_tokens="5000000"
 seed=1227
 deepspeed_config_file=conf/deepspeed/bf16_zero1_default.json
 num_selects=4
@@ -80,10 +80,12 @@ deepspeed \
   --per_device_eval_batch_size ${per_device_eval_batch_size} \
   --do_train \
   --do_eval \
+  --dispatch_batches False \
   --evaluation_strategy steps \
   --eval_steps 1000 \
   --seed ${seed} \
   --bf16 \
+  --debug_mode \
   --num_train_epochs 1 \
   --final_lr_portion ${final_lr_portion} \
   --optim adamw_torch \

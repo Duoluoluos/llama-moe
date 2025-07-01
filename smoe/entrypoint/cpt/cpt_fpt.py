@@ -24,7 +24,7 @@ from transformers.trainer_utils import get_last_checkpoint
 sys.path.append('.')
 from smoe.callbacks.save_model import SchedulerStateCallback
 from smoe.callbacks.tensorboard import EnhancedTensorboardCallback
-from smoe.data.collate_fn import fault_tolerance_data_collator
+from smoe.data.collate_fn import fault_tolerance_data_collator, collate_fn_lm
 from smoe.data.dynamic_selection import (
     AVERAGE_SLIMPAJAMA_DATA_PORTION,
     LLAMA_DATA_PORTION,
@@ -51,6 +51,29 @@ from smoe.utils.config import (
 )
 from smoe.utils.notification import wechat_sender
 from smoe.utils.param import get_trainable_parameters
+from smoe.utils.debugging import cast_all_buffers
+from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+
+# #################################### 热补丁
+# _orig_forward = LlamaRotaryEmbedding.forward
+
+# def _patched_forward(self, x, position_ids):
+#     # ⚠️ 如果 inv_freq 与输入 dtype 不一致，就即时对齐并刷新 cache
+#     print(self.inv_freq.dtype)
+#     print(x.dtype)
+#     if self.inv_freq.dtype != x.dtype:
+#         self.inv_freq = self.inv_freq.to(dtype=x.dtype)
+#         # 删掉旧的 cos/sin cache，下一行 super(...) 会自动重建
+#         self.cos_cached = None
+#         self.sin_cached = None
+#         self.max_seq_len_cached = 0
+#     return _orig_forward(self, x, position_ids)
+
+# # 打补丁：只需执行一次，之后所有实例都会生效
+# LlamaRotaryEmbedding.forward = _patched_forward
+
+
+
 
 MODEL_MAP = {
     "llama": LlamaForCausalLM,
@@ -119,10 +142,10 @@ def main():
     # logger.info(f"Data args: {data_args}")
     # logger.info(f"Training args: {training_args.to_json_string()}")
 
-    if training_args.debug_mode:
-        from smoe.utils.debugging import remote_breakpoint
+    # if training_args.debug_mode:
+    #     from smoe.utils.debugging import remote_breakpoint
 
-        remote_breakpoint()
+    #     remote_breakpoint()
 
     # Detecting last checkpoint.
     last_checkpoint = None
@@ -189,9 +212,7 @@ def main():
     if training_args.gradient_checkpointing:
         config.use_cache = False
 
-    # zhutong: this is for debug usage only
-    if training_args.debug_mode:
-        config.num_hidden_layers = 2
+
 
     if model_args.model_type == "mixtral" or model_args.model_name_or_path == "mixtral":
         config.num_experts_per_tok = model_args.num_selects
@@ -216,8 +237,7 @@ def main():
             " by this script.You can do it from another script, save it, and load it"
             " from here, using --tokenizer_name."
         )
-
-    # Preprocessing the datasets.
+    
     if data_args.block_size is None:
         block_size = tokenizer.model_max_length
         if block_size > 1024:
@@ -238,10 +258,7 @@ def main():
         block_size = min(data_args.block_size, tokenizer.model_max_length)
 
     prob_map = TOY_DATA
-    # if data_args.prob_map == "uniform":
-    #     prob_map = AVERAGE_SLIMPAJAMA_DATA_PORTION
-    # elif data_args.prob_map == "sheared_llama":
-    #     prob_map = SHEAREDLLAMA_DATA_PORTION
+
 
     with training_args.main_process_first(desc="dataset map tokenization and grouping"):
         lm_datasets = PackedJsonlDataset(
@@ -249,19 +266,11 @@ def main():
             seed=training_args.seed,
             block_size=data_args.block_size,
         )
-        # lm_datasets = load_streaming_datasets(
-        #     data_args.dataset_dir,
-        #     prob_map=data_args.prob_map,
-        #     num_proc=data_args.preprocessing_num_workers,
-        #     debug_mode=training_args.debug_mode,
-        #     block_size=data_args.block_size,
-        # )
-
     if training_args.do_train:
         train_dataset = lm_datasets
         if data_args.max_train_samples is None:
             raise ValueError("max_train_samples cannot be None")
-        logger.info("training example:")
+        # logger.info("training example:")
         res = None
         if hasattr(train_dataset, "take"):
             res = tokenizer.decode([x["input_ids"] for x in train_dataset.take(1)][0])
@@ -283,73 +292,99 @@ def main():
             for path in paths
         }
         #logger.info(f"eval types: {list(eval_dataset.keys())}")
-
-    if model_args.model_name_or_path:
-        torch_dtype = (
-            model_args.torch_dtype
-            if model_args.torch_dtype in ["auto", None]
-            else getattr(torch, model_args.torch_dtype)
-        )
-        ModelClass = MODEL_MAP[model_args.model_type]
-
-        # model = LlamaForCausalLM(config)
-        # model.half()
-        # model.to(torch_dtype)
-
-        if isinstance(config, MixtralConfig):
-            config._attn_implementation = "flash_attention_2"
-
-        # model: LlamaForCausalLM | LlamaMoEForCausalLM | LlamaMoEResidualForCausalLM | MixtralForCausalLM = ModelClass.from_pretrained(
-        #     model_args.model_name_or_path,
-        #     from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        #     config=config,
-        #     cache_dir=model_args.cache_dir,
-        #     revision=model_args.model_revision,
-        #     use_auth_token=True if model_args.use_auth_token else None,
-        #     torch_dtype=torch_dtype,
-        #     low_cpu_mem_usage=True,
-        # )
+    torch_dtype = ( model_args.torch_dtype
+    if model_args.torch_dtype in ["auto", None]
+    else getattr(torch, model_args.torch_dtype)
+    )
+    # zhutong: this is for debug usage only
+    if training_args.debug_mode:
+        debug_config = config.to_dict()
+        # 用户原有config参数基础上覆盖以下值
+        debug_config = {
+            "hidden_size": 512,  # 原4096
+            "intermediate_size": 1024,  # 原11008
+            "num_hidden_layers": 2,  # 原32
+            "num_attention_heads": 4,  # 原32
+            "num_key_value_heads": 2,  # 保持与attention heads比例
+            "num_experts": 4,  # 原16
+            "num_selects": 2,  # 原4
+            "gate_add_noise": False,  # 关闭噪声
+            "gate_balance_loss_weight": 0,  # 关闭负载均衡损失
+            "capacity_factor": 1.0,  # 关闭buffer
+            "use_cache": False,  # 关闭KV缓存
+            "vocab_size": tokenizer.vocab_size,
+        }
+        debug_config = config.__class__(**debug_config)
+        logger.warning(f"DEBUG MODE: Creating minimal model:{debug_config}")
         with init_empty_weights():
-            model = ModelClass(config)  
-        model = load_checkpoint_and_dispatch(
-            model,
-            checkpoint=model_args.model_name_or_path,
-            device_map={"": device.index},          # 每个 rank 放到自己那张卡
-            dtype=torch_dtype,
-            no_split_module_classes=[
-                "LlamaDecoderLayer", "LlamaMoEDecoderLayer"
-            ],
-        )
-
-
+            model = LlamaMoEForCausalLM(debug_config)
+            model = model.to_empty(device=device) 
+            
     else:
-        model = AutoModelForCausalLM.from_config(config)
-        n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
-        logger.info(
-            f"Training new model from scratch - Total size={n_params / 2 ** 20:.2f}M params"
-        )
-    logger.info(f'Params:{model.named_parameters()}')
+        # Preprocessing the datasets.
+        if model_args.model_name_or_path:
 
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
-    else:
+            ModelClass = MODEL_MAP[model_args.model_type]
 
-        def make_inputs_require_grad(module, input, output):
-            output.requires_grad_(True)
+            if isinstance(config, MixtralConfig):
+                config._attn_implementation = "flash_attention_2"
 
-        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+            with init_empty_weights():
+                model = ModelClass(config)  
+            
+            model = load_checkpoint_and_dispatch(
+                model,
+                checkpoint=model_args.model_name_or_path,
+                device_map={"": device.index},          # 每个 rank 放到自己那张卡
+                dtype=torch_dtype,
+                no_split_module_classes=[
+                    "LlamaDecoderLayer", "LlamaMoEDecoderLayer"
+                ],
+            )
 
 
-    model_vocab_size = model.get_output_embeddings().weight.size(0)
+        else:
+            model = AutoModelForCausalLM.from_config(config)
+            n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
+            logger.info(
+                f"Training new model from scratch - Total size={n_params / 2 ** 20:.2f}M params"
+            )
+        logger.info(f'Params:{model.named_parameters()}')
+
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        else:
+
+            def make_inputs_require_grad(module, input, output):
+                output.requires_grad_(True)
+
+            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+
+        model_vocab_size = model.get_output_embeddings().weight.size(0)
 
     # Set
     model = DDP(model, device_ids=[device], output_device=device, find_unused_parameters=False)
-
+    # print(model.forward.__code__.co_varnames)
 
     trainable_params, _ = get_trainable_parameters(model, verbose=True)
     training_args.num_training_params = trainable_params
 
     # Initialize our Trainer
+    # trainer = LlamaLrSchedulingTrainer(
+    #     model=model,
+    #     args=training_args,
+    #     train_dataset=train_dataset if training_args.do_train else None,
+    #     eval_dataset=eval_dataset if training_args.do_eval else None,
+    #     tokenizer=tokenizer,
+    #     data_collator=fault_tolerance_data_collator,
+    #     compute_metrics=None,
+    #     preprocess_logits_for_metrics=(
+    #         logits_argmax
+    #         if training_args.do_eval
+    #         else None
+    #     ),
+    # )
     trainer = LlamaLrSchedulingTrainer(
         model=model,
         args=training_args,

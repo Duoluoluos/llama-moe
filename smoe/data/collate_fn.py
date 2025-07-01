@@ -1,8 +1,67 @@
 from typing import Any, Mapping
-
+from typing import List, Dict
 import numpy as np
 import torch
 import torch.nn.utils.rnn as rnn_utils
+
+
+
+def collate_fn_lm(
+    batch: List[Dict],
+    pad_token_id: int = 0,
+    block_size: int | None = 128,
+    return_labels: bool = True,
+):
+    """
+    通用 Language-Modeling collate_fn.
+    
+    Args
+    ----
+    batch : list[dict]            # DataLoader 传进来的一个 batch
+    pad_token_id : int            # tokenizer.pad_token_id；若没有 pad_token，可用 0
+    block_size : int | None       # 若传入则强制截断/填充到固定长度
+    return_labels : bool          # 若为 True，则把 labels = input_ids.clone()
+    
+    Returns
+    -------
+    dict[str, torch.Tensor]       # keys: input_ids, attention_mask, (labels)
+    """
+    # print(batch)
+    # 1) 原始序列
+    seqs = [example["input_ids"] for example in batch]
+    lengths = [len(s) for s in seqs]
+
+    # 2) 计算目标长度
+    if block_size is None:
+        max_len = max(lengths)                      # 动态 pad
+    else:
+        max_len = block_size                        # 固定长度（比如 2048）
+
+    # 3) 预分配张量（B, L）
+    B = len(seqs)
+    input_ids = torch.full((B, max_len),
+                           pad_token_id,
+                           dtype=torch.long)
+    attention_mask = torch.zeros((B, max_len),
+                                 dtype=torch.long)
+
+    # 4) 填充
+    for i, seq in enumerate(seqs):
+        seq = seq[:max_len]                         # 截断（若太长）
+        seq_len = len(seq)
+        input_ids[i, :seq_len] = torch.as_tensor(seq, dtype=torch.long)
+        attention_mask[i, :seq_len] = 1
+
+    batch_dict = {
+        "input_ids":      input_ids,
+        "attention_mask": attention_mask,
+    }
+    if return_labels:
+        batch_dict["labels"] = input_ids.clone()
+
+    return batch_dict
+
+
 
 
 def fault_tolerance_data_collator(features: list) -> dict[str, Any]:
