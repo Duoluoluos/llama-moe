@@ -119,20 +119,31 @@ def preprocess(
     # Apply prompt templates
     conversations = []
     for i, ins in enumerate(instances):
-        if roles[ins["conversations"][0]["from"]] != roles["human"]:
-            # Skip the first one if it is not from human
-            ins["conversations"] = ins["conversations"][1:]
-
         conv.clear_msg()
-        sys_msg = ins.get("system_prompt")
-        if sys_msg is not None:
-            conv.set_system_message(sys_msg)
+        sys_msg = ins.get("system_prompt", "")
+        conv.set_system_message(sys_msg)
+
+        # Check if data is in instruction/input/output format
+        if "instruction" in ins and "output" in ins:
+            # Handle instruction/input/output format
+            human_msg = ins["instruction"]
+            if "input" in ins and ins["input"]:
+                human_msg += f"\n{ins['input']}"
+            conv.append_message(roles["human"], human_msg)
+            conv.append_message(roles["gpt"], ins["output"])
+        elif "conversations" in ins and len(ins["conversations"]) > 0:
+            # Handle original conversations format
+            if roles[ins["conversations"][0]["from"]] != roles["human"]:
+                # Skip the first one if it is not from human
+                ins["conversations"] = ins["conversations"][1:]
+
+            for j, turn in enumerate(ins["conversations"]):
+                role = roles[turn["from"]]
+                assert role == conv.roles[j % 2], f"{i}/{j}"
+                conv.append_message(role, turn["value"])
         else:
-            conv.set_system_message("")
-        for j, turn in enumerate(ins["conversations"]):
-            role = roles[turn["from"]]
-            assert role == conv.roles[j % 2], f"{i}/{j}"
-            conv.append_message(role, turn["value"])
+            raise ValueError(f"Unsupported data format for instance {i}: {ins.keys()}")
+
         conversations.append(conv.get_prompt())
 
     # Tokenize conversations
