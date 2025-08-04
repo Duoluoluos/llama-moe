@@ -17,10 +17,13 @@ from transformers import (
     AutoTokenizer,
     LlamaConfig,
     LlamaForCausalLM,
+    Qwen2ForCausalLM,
     LlamaTokenizer,
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
+from datasets import Dataset as HFDataset
+
 sys.path.append('.')
 from smoe.callbacks.save_model import SchedulerStateCallback
 from smoe.callbacks.tensorboard import EnhancedTensorboardCallback
@@ -31,7 +34,7 @@ from smoe.data.dynamic_selection import (
     SHEAREDLLAMA_DATA_PORTION,
     TOY_DATA
 )
-from smoe.data.streaming import CachedJsonlDataset, SubDirWeightedPackedJsonlDataset, PackedJsonlDataset
+from smoe.data.streaming import CachedJsonlDataset, SubDirWeightedPackedJsonlDataset, PackedJsonlDataset, load_process_and_create_hf_dataset
 from smoe.metrics.preprocess import logits_argmax
 from smoe.models.llama_moe.configuration_llama_moe import LlamaMoEConfig
 from smoe.models.llama_moe.modeling_llama_moe import LlamaMoEForCausalLM
@@ -41,7 +44,7 @@ from smoe.models.llama_moe_residual import (
 )
 from smoe.models.mixtral.configuration_mixtral import MixtralConfig
 from smoe.models.mixtral.modeling_mixtral import MixtralForCausalLM
-from smoe.modules.flash_attn import replace_xformers
+# from smoe.modules.flash_attn import replace_xformers
 from smoe.trainer.llama_lr_scheduling import LlamaLrSchedulingTrainer
 from smoe.utils.config import (
     DataArguments,
@@ -54,32 +57,12 @@ from smoe.utils.param import get_trainable_parameters
 from smoe.utils.debugging import cast_all_buffers
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
-# #################################### 热补丁
-# _orig_forward = LlamaRotaryEmbedding.forward
-
-# def _patched_forward(self, x, position_ids):
-#     # ⚠️ 如果 inv_freq 与输入 dtype 不一致，就即时对齐并刷新 cache
-#     print(self.inv_freq.dtype)
-#     print(x.dtype)
-#     if self.inv_freq.dtype != x.dtype:
-#         self.inv_freq = self.inv_freq.to(dtype=x.dtype)
-#         # 删掉旧的 cos/sin cache，下一行 super(...) 会自动重建
-#         self.cos_cached = None
-#         self.sin_cached = None
-#         self.max_seq_len_cached = 0
-#     return _orig_forward(self, x, position_ids)
-
-# # 打补丁：只需执行一次，之后所有实例都会生效
-# LlamaRotaryEmbedding.forward = _patched_forward
-
-
-
 
 MODEL_MAP = {
+    "qwen2": Qwen2ForCausalLM,
     "llama": LlamaForCausalLM,
     "llama_moe": LlamaMoEForCausalLM,
     "llama_moe_residual": LlamaMoEResidualForCausalLM,
-    "mixtral": MixtralForCausalLM,
 }
 
 CONFIG_MAPPING.update(
@@ -87,7 +70,6 @@ CONFIG_MAPPING.update(
         "llama": LlamaConfig,
         "llama_moe": LlamaMoEConfig,
         "llama_moe_residual": LlamaMoEResidualConfig,
-        "mixtral": MixtralConfig,
     }
 )
 
@@ -138,14 +120,6 @@ def main():
         f"fp16 training: {training_args.fp16}, "
         f"bf16 training: {training_args.bf16}"
     )
-    # logger.info(f"Model args: {model_args}")
-    # logger.info(f"Data args: {data_args}")
-    # logger.info(f"Training args: {training_args.to_json_string()}")
-
-    # if training_args.debug_mode:
-    #     from smoe.utils.debugging import remote_breakpoint
-
-    #     remote_breakpoint()
 
     # Detecting last checkpoint.
     last_checkpoint = None
@@ -192,8 +166,6 @@ def main():
         or model_args.model_type == "llama_moe_residual"
     ):
         ConfigClass = LlamaMoEResidualConfig
-    elif model_args.config_name == "mixtral" or model_args.model_type == "mixtral":
-        ConfigClass = MixtralConfig
 
     if model_args.config_name:
         config = ConfigClass.from_pretrained(model_args.config_name, **config_kwargs)
@@ -212,11 +184,6 @@ def main():
     if training_args.gradient_checkpointing:
         config.use_cache = False
 
-
-
-    if model_args.model_type == "mixtral" or model_args.model_name_or_path == "mixtral":
-        config.num_experts_per_tok = model_args.num_selects
-        config.output_router_logits = True
 
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -284,18 +251,28 @@ def main():
 
     eval_dataset = None
     if training_args.do_eval:
-        paths = Path(data_args.validation_dir).glob("*.jsonl")
-        eval_dataset = {
-            path.stem: CachedJsonlDataset(
-                str(path), training_args.seed, block_size=data_args.block_size
-            )
-            for path in paths
-        }
-        #logger.info(f"eval types: {list(eval_dataset.keys())}")
-    torch_dtype = ( model_args.torch_dtype
-    if model_args.torch_dtype in ["auto", None]
-    else getattr(torch, model_args.torch_dtype)
-    )
+        validation_dir = Path(data_args.validation_dir)
+        jsonl_files = list(validation_dir.glob("*.jsonl"))
+        if len(jsonl_files) == 0:
+            raise FileNotFoundError(f"Evaluation is enabled, but no .jsonl files were found in {validation_dir}")
+        
+        if len(jsonl_files) > 1:
+            raise ValueError(f"Multiple .jsonl files found in {validation_dir}. Please specify a directory with only one validation file.")
+
+        validation_file_path = jsonl_files[0]
+        eval_dataset = load_process_and_create_hf_dataset(data_args.block_size, validation_file_path, debug = False)
+
+
+    if training_args.do_predict:
+        predict_dataset = lm_datasets
+        if data_args.max_predict_samples is None:
+            raise ValueError("max_predict_samples cannot be None")
+
+    if training_args.do_train:
+        torch_dtype = ( model_args.torch_dtype
+        if model_args.torch_dtype in ["auto", None]
+        else getattr(torch, model_args.torch_dtype)
+        )
     # zhutong: this is for debug usage only
     if training_args.debug_mode:
         debug_config = config.to_dict()
@@ -322,12 +299,9 @@ def main():
             
     else:
         # Preprocessing the datasets.
-        if model_args.model_name_or_path:
+        if 'moe' in model_args.model_type:
 
             ModelClass = MODEL_MAP[model_args.model_type]
-
-            if isinstance(config, MixtralConfig):
-                config._attn_implementation = "flash_attention_2"
 
             with init_empty_weights():
                 model = ModelClass(config)  
@@ -342,13 +316,13 @@ def main():
                 ],
             )
 
-
         else:
             model = AutoModelForCausalLM.from_config(config)
             n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
             logger.info(
                 f"Training new model from scratch - Total size={n_params / 2 ** 20:.2f}M params"
             )
+        model.to(device)
         logger.info(f'Params:{model.named_parameters()}')
 
         if hasattr(model, "enable_input_require_grads"):
@@ -364,27 +338,16 @@ def main():
         model_vocab_size = model.get_output_embeddings().weight.size(0)
 
     # Set
-    model = DDP(model, device_ids=[device], output_device=device, find_unused_parameters=False)
-    # print(model.forward.__code__.co_varnames)
+    model = DDP( model,
+    device_ids=[local_rank],        # 也可以直接省略这两个参数
+    output_device=local_rank,       # （若省略则让 DDP 自动推断）
+    find_unused_parameters=False
+    )
 
     trainable_params, _ = get_trainable_parameters(model, verbose=True)
     training_args.num_training_params = trainable_params
 
     # Initialize our Trainer
-    # trainer = LlamaLrSchedulingTrainer(
-    #     model=model,
-    #     args=training_args,
-    #     train_dataset=train_dataset if training_args.do_train else None,
-    #     eval_dataset=eval_dataset if training_args.do_eval else None,
-    #     tokenizer=tokenizer,
-    #     data_collator=fault_tolerance_data_collator,
-    #     compute_metrics=None,
-    #     preprocess_logits_for_metrics=(
-    #         logits_argmax
-    #         if training_args.do_eval
-    #         else None
-    #     ),
-    # )
     trainer = LlamaLrSchedulingTrainer(
         model=model,
         args=training_args,
@@ -398,6 +361,7 @@ def main():
             if training_args.do_eval
             else None
         ),
+        model_type=model_args.model_type,
     )
     trainer.add_callback(EnhancedTensorboardCallback)
     trainer.add_callback(SchedulerStateCallback)
@@ -420,19 +384,9 @@ def main():
 
     # Evaluation
     if training_args.do_eval:
-        if isinstance(trainer.eval_dataset, dict):
-            metrics = {}
-            for eval_dataset_name, eval_dataset in trainer.eval_dataset.items():
-                dataset_metrics = trainer.evaluate(
-                    eval_dataset=eval_dataset,
-                    ignore_keys=None,
-                    metric_key_prefix=f"eval_{eval_dataset_name}",
-                )
-                metrics.update(dataset_metrics)
-        else:
-            metrics = trainer.evaluate(ignore_keys=None)
+        metrics = trainer.evaluate(ignore_keys=None)
         logger.info(f"{metrics}")
-    
+
     if dist.is_initialized():
         dist.destroy_process_group()
 

@@ -5,10 +5,11 @@ import shutil
 import socket
 import sys
 import time
+import inspect
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 from packaging import version
 
@@ -152,16 +153,23 @@ class EnhancedTrainerState(TrainerState):
 
 
 class LlamaLrSchedulingTrainer(Trainer):
-    def __init__(self, do_grad_scaling=False, use_apex = False , weighted_ds=False , *args, **kwargs):
+    def __init__(self, do_grad_scaling=False, use_apex = False , weighted_ds=False , model_type = "llama" , *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.state.__class__ = EnhancedTrainerState
+        # Manually initialize the attributes defined in EnhancedTrainerState,
+        # because the __init__ of the dataclass was not called.
+        self.state.start_timestamp = 0.0
+        self.state.consumed_tokens = {}  # This directly fixes the AttributeError
+        self.state.tot_consumed_tokens = 0
         self.weighted_ds = weighted_ds
         self.do_grad_scaling = do_grad_scaling
         self.use_apex = use_apex
+        self.model_type = model_type
         self.args: EnhancedTrainingArguments
-        self.state: EnhancedTrainerState = EnhancedTrainerState(
-            is_local_process_zero=self.is_local_process_zero(),
-            is_world_process_zero=self.is_world_process_zero(),
-        )
+        # self.state: EnhancedTrainerState = EnhancedTrainerState(
+        #     is_local_process_zero=self.is_local_process_zero(),
+        #     is_world_process_zero=self.is_world_process_zero(),
+        # )
 
     def create_optimizer(self):
         """
@@ -333,13 +341,14 @@ class LlamaLrSchedulingTrainer(Trainer):
                 4,
             )
             logs["learning_rate"] = self._get_learning_rate()
-            logs["num_dropped_tokens"] = [x.item() for x in num_dropped_tokens]
-            logs["gate_load"] = [x.detach().cpu().tolist() for x in gate_load]
-            logs["gate_importance"] = [
-                x.detach().cpu().tolist() for x in gate_importance
-            ]
-            logs["balance_loss"] = balance_loss.item()
-            logs["tot_consumed_tokens"] = self.state.tot_consumed_tokens
+            if "moe" in self.model_type:
+                logs["num_dropped_tokens"] = [x.item() for x in num_dropped_tokens]
+                logs["gate_load"] = [x.detach().cpu().tolist() for x in gate_load]
+                logs["gate_importance"] = [
+                    x.detach().cpu().tolist() for x in gate_importance
+                ]
+                logs["balance_loss"] = balance_loss.item()
+                logs["tot_consumed_tokens"] = self.state.tot_consumed_tokens
             if self.weighted_ds:
                 logs["prob_map"] = self.train_dataset.prob_map
 
@@ -403,9 +412,9 @@ class LlamaLrSchedulingTrainer(Trainer):
         if self.control.should_save:
             self._save_checkpoint(model, trial, metrics=metrics)
             # zhutong: lr_scheduler is passed as an arg in `transformers.trainer_callback/CallbackHandler.call_event()`
-            self.control = self.callback_handler.on_save(
-                self.args, self.state, self.control
-            )
+            # self.control = self.callback_handler.on_save(
+            #     self.args, self.state, self.control
+            # )
 
     def _rotate_checkpoints(self, use_mtime=False, output_dir=None) -> None:
         if self.args.save_total_limit is None or self.args.save_total_limit <= 0:
@@ -624,7 +633,7 @@ class LlamaLrSchedulingTrainer(Trainer):
         if not delay_optimizer_creation:
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
-        self.state = EnhancedTrainerState()
+        # self.state = EnhancedTrainerState()
         self.state.is_hyper_param_search = trial is not None
 
         # Activate gradient checkpointing if needed

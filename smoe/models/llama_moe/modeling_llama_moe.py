@@ -586,16 +586,6 @@ class LlamaMoEForCausalLM(LlamaForCausalLM, LlamaMoEPreTrainedModel):
                 shift_logits.transpose(1, 2),       # [B, V, L-1]  ← 仍是非连续 OK
                 shift_labels                        # [B, L-1]
             )
-            # # Shift so that tokens < n predict n
-            # shift_logits = logits[..., :-1, :].contiguous()
-            # shift_labels = labels[..., 1:].contiguous()
-            # # Flatten the tokens
-            # loss_fct = CrossEntropyLoss()
-            # shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            # shift_labels = shift_labels.view(-1)
-            # # Enable model parallelism
-            # shift_labels = shift_labels.to(shift_logits.device)
-            # loss = loss_fct(shift_logits, shift_labels)
             if outputs.balance_loss is not None and outputs.balance_loss > 0:
                 loss += outputs.balance_loss
 

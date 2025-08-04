@@ -4,11 +4,11 @@ References:
     - https://github.com/jzhang38/TinyLlama/blob/main/pretrain/tinyllama.py
     - https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/data/indexed_dataset.py
 """
-
 import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
+from datasets import Dataset as HFDataset
 
 import numpy as np
 import torch
@@ -22,6 +22,17 @@ from smoe.utils.vars import JSONL_DATASET_CACHE_NAME, META_SUFFIX
 
 logger = get_logger(__file__)
 
+
+def load_process_and_create_hf_dataset(block_size: int, filepath: Path, debug = False) -> HFDataset:
+    """
+    辅助函数：直接加载、处理数据，并一步到位创建 HFDataset。
+    """
+    raw_data_list = load_jsonlines(str(filepath))
+    processed_data_list = group_instances(raw_data_list, block_size)
+    if debug:
+        # processed_data_list只需10条足以
+        processed_data_list = processed_data_list[:10]
+    return HFDataset.from_list(processed_data_list)
 
 class JsonlDataset(IterableDataset):
     def __init__(
