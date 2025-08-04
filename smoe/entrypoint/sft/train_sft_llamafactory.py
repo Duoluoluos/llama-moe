@@ -2,31 +2,32 @@ import math
 import pathlib
 import random
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Optional
 
-import numpy as np
 import torch
 import transformers
 from loguru import logger
 from torch.utils.data import Dataset
-from transformers import PreTrainedTokenizer, Trainer
-from transformers.trainer_pt_utils import LabelSmoother
+from transformers import PreTrainedTokenizer
 
 from smoe.utils.conversation import Conversation
-from smoe.utils.io import load_json, load_jsonlines
+from smoe.utils.io import load_jsonlines
+from llamafactory.train import LLaMATrainer, LLaMATrainingArguments
+from llamafactory.model import load_model_and_tokenizer
 
-IGNORE_TOKEN_ID = LabelSmoother.ignore_index
+IGNORE_TOKEN_ID = -100
 
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(default=None)
-    tokenizer_name_or_path: Optional[str] = field(default=None)
+    model_name_or_path: str = field(
+        default=None, metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    )
+    tokenizer_name_or_path: Optional[str] = field(
+        default=None, metadata={"help": "Path to pretrained tokenizer"}
+    )
     trust_remote_code: bool = field(
-        default=True,
-        metadata={
-            "help": "Whether or not to allow for custom models defined on the Hub in their own modeling files"
-        },
+        default=True, metadata={"help": "Whether or not to allow for custom models defined on the Hub"}
     )
     padding_side: str = field(
         default="right", metadata={"help": "The padding side in tokenizer"}
@@ -35,18 +36,14 @@ class ModelArguments:
         default="auto", metadata={"help": "Model type: `moe` or `mixtral` or `auto`"}
     )
     torch_dtype: str = field(
-        default="auto",
-        metadata={"help": "Torch dtype: `float32` or `bfloat16`"},
+        default="auto", metadata={"help": "Torch dtype: `float32` or `bfloat16`"}
     )
     additional_config: str = field(
-        default=None,
-        metadata={"help": "Additional config file (in json) to load"},
+        default=None, metadata={"help": "Additional config file (in json) to load"}
     )
     attn_impl: str = field(
         default="flash_attention_2",
-        metadata={
-            "help": "attention implementation, choice from [eager, flash_attention_2, sdpa] (default: `flash_attention_2`)"
-        },
+        metadata={"help": "attention implementation, choice from [eager, flash_attention_2, sdpa]"}
     )
 
     def __post_init__(self):
@@ -54,9 +51,8 @@ class ModelArguments:
             self.torch_dtype = getattr(torch, self.torch_dtype)
         if self.additional_config is not None:
             if not pathlib.Path(self.additional_config).exists():
-                raise ValueError(
-                    f"Additional config file {self.additional_config} not found"
-                )
+                raise ValueError(f"Additional config file {self.additional_config} not found")
+            from smoe.utils.io import load_json
             self.additional_config = load_json(self.additional_config)
 
 
@@ -66,24 +62,17 @@ class DataArguments:
         default=None, metadata={"help": "Path to the evaluation data folder."}
     )
     dataset_dir_or_path: str = field(
-        default="data/merged",
-        metadata={"help": "Path to dataset directory or a single jsonl file"},
+        default="data/merged", metadata={"help": "Path to dataset directory or a single jsonl file"}
     )
 
 
 @dataclass
-class TrainingArguments(transformers.TrainingArguments):
+class TrainingArguments(LLaMATrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
     model_max_length: int = field(
         default=2048,
-        metadata={
-            "help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."
-        },
-    )
-    freeze_gate: bool = field(
-        default=False,
-        metadata={"help": "Whether to freeze the gate during training."},
+        metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."}
     )
     train_only_gate: bool = field(
         default=False,
@@ -95,16 +84,37 @@ class TrainingArguments(transformers.TrainingArguments):
     )
 
 
-def trainer_save_model_safe(trainer):
-    from torch.distributed.fsdp import FullStateDictConfig
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    from torch.distributed.fsdp import StateDictType
+class CachedJsonlDataset(Dataset):
+    def __init__(
+        self,
+        datapath: str,
+        tokenizer: PreTrainedTokenizer,
+        seed: int = 1227,
+    ) -> None:
+        super().__init__()
+        self.datapath = datapath
+        self.rng = random.Random(seed)
+        self.tokenizer = tokenizer
+        self.data = load_jsonlines(datapath)
+        self.rng.shuffle(self.data)
 
-    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(
-        trainer.model, StateDictType.FULL_STATE_DICT, save_policy
-    ):
-        trainer.save_model()
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, index):
+        ins = self.data[index]
+        processed = preprocess([ins], self.tokenizer)
+        ins = {}
+        for key in processed:
+            ins[key] = processed[key][0]
+        return ins
+
+    def state_dict(self):
+        return {
+            "datapath": self.datapath,
+            "seed": self.seed,
+            "rng": self.rng.getstate(),
+        }
 
 
 def preprocess(
@@ -149,14 +159,10 @@ def preprocess(
 
     # Mask targets. Only compute loss on the assistant outputs.
     sep = conv.sep + conv.roles[1] + ": "
-    # attention_masks = torch.ones_like(input_ids)
     for conversation, target, attention_mask in zip(
         conversations, targets, attention_masks
     ):
         turns = conversation.split(conv.sep2)
-        # the eos token is included in `total_len`, llama2 will add bos token
-        # total_len = int(target.ne(tokenizer.pad_token_id).sum()) + len(turns) * int(tokenizer.pad_token == tokenizer.eos_token)
-        # attention_mask[total_len:] = 0
         total_len = attention_mask.sum()
 
         cur_len = 0
@@ -187,9 +193,6 @@ def preprocess(
             # Ignore the user instructions
             target[cur_len : cur_len + instruction_len] = IGNORE_TOKEN_ID
             cur_len += turn_len
-            # if i < len(turns) - 1:
-            #     # plus one for sep2 token (eos)
-            #     cur_len += 1
 
             if i != 0 and not tokenizer_legacy:
                 # The legacy and non-legacy modes handle special tokens differently
@@ -213,7 +216,7 @@ def preprocess(
 
 
 def fault_tolerance_data_collator(features: list) -> dict[str, Any]:
-    if not isinstance(features[0], Mapping):
+    if not isinstance(features[0], Dict):
         try:
             features = [vars(f) for f in features]
         except TypeError:
@@ -222,8 +225,6 @@ def fault_tolerance_data_collator(features: list) -> dict[str, Any]:
     batch = {}
 
     # Special handling for labels.
-    # Ensure that tensor is created with the correct type
-    # (it should be automatically the case, but let's make sure of it.)
     if "label" in first and first["label"] is not None:
         label = (
             first["label"].item()
@@ -244,8 +245,6 @@ def fault_tolerance_data_collator(features: list) -> dict[str, Any]:
             )
 
     # Handling of all other possible keys.
-    # Again, we will use the first element to figure out which key/values are not None for this model.
-
     try:
         for k, v in first.items():
             if (
@@ -276,147 +275,6 @@ def fault_tolerance_data_collator(features: list) -> dict[str, Any]:
     return batch
 
 
-class CachedJsonlDataset(Dataset):
-    def __init__(
-        self,
-        datapath: str,
-        tokenizer: PreTrainedTokenizer,
-        seed: int = 1227,
-    ) -> None:
-        super().__init__()
-        self.datapath = datapath
-        self.rng = random.Random(seed)
-        self.tokenizer = tokenizer
-        self.data = load_jsonlines(datapath)
-        self.rng.shuffle(self.data)
-
-    def __len__(self) -> int:
-        return len(self.data)
-
-    def __getitem__(self, index):
-        ins = self.data[index]
-        processed = preprocess([ins], self.tokenizer)
-        ins = {}
-        for key in processed:
-            ins[key] = processed[key][0]
-        return ins
-
-    def state_dict(self):
-        return {
-            "datapath": self.datapath,
-            "seed": self.seed,
-            "rng": self.rng.getstate(),
-        }
-
-
-def get_tokenizer(
-    model_name_or_path,
-    cache_dir: str = None,
-    model_max_length: int = 2048,
-    padding_side: str = "right",
-    use_fast: bool = False,
-    trust_remote_code: bool = False,
-):
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_name_or_path,
-        cache_dir=cache_dir,
-        model_max_length=model_max_length,
-        padding_side=padding_side,
-        use_fast=use_fast,
-        trust_remote_code=trust_remote_code,
-    )
-    if tokenizer.pad_token is None:
-        if tokenizer.unk_token is not None:
-            tokenizer.pad_token = tokenizer.unk_token
-        else:
-            tokenizer.pad_token = tokenizer.eos_token
-    logger.info(f"tokenizer ready, pad_token: {tokenizer.pad_token}")
-    return tokenizer
-
-
-def get_model(
-    model_type: str,
-    model_name_or_path: str,
-    torch_dtype: str = "auto",
-    model_max_length: int = 2048,
-    attn_impl: str = "flash_attention_2",
-    cache_dir: str = None,
-    trust_remote_code: bool = False,
-    additional_config: dict = None,
-):
-    logger.info(f"Model type: {model_type}")
-    if model_type == "auto":
-        ConfigClass = transformers.AutoConfig
-        ModelClass = transformers.AutoModelForCausalLM
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
-
-    # Set RoPE scaling factor
-    config = ConfigClass.from_pretrained(
-        model_name_or_path,
-        cache_dir=cache_dir,
-        trust_remote_code=trust_remote_code,
-    )
-    orig_ctx_len = getattr(config, "max_position_embeddings", None)
-    if orig_ctx_len and model_max_length > orig_ctx_len:
-        scaling_factor = float(math.ceil(model_max_length / orig_ctx_len))
-        config.rope_scaling = {"type": "linear", "factor": scaling_factor}
-    config.use_cache = False
-    if additional_config is not None:
-        config.update(additional_config)
-    logger.info("Config ready")
-
-    # Load model and tokenizer
-    model = ModelClass.from_pretrained(
-        model_name_or_path,
-        config=config,
-        cache_dir=cache_dir,
-        torch_dtype=torch_dtype,
-        trust_remote_code=trust_remote_code,
-        attn_implementation=attn_impl,
-    )
-    logger.info("model ready")
-
-    return model
-
-
-def get_model_and_tokenizer(
-    model_type: str,
-    model_name_or_path: str,
-    tokenizer_path: str = None,
-    torch_dtype: str = "auto",
-    model_max_length: int = 2048,
-    attn_impl: str = "flash_attention_2",
-    cache_dir: str = None,
-    trust_remote_code: bool = False,
-    padding_side: str = "right",
-    additional_config: dict = None,
-    use_fast: bool = False,
-) -> tuple:
-    if tokenizer_path is None:
-        tokenizer_path = model_name_or_path
-    tokenizer = get_tokenizer(
-        tokenizer_path,
-        cache_dir=cache_dir,
-        model_max_length=model_max_length,
-        padding_side=padding_side,
-        use_fast=use_fast,
-        trust_remote_code=trust_remote_code,
-    )
-    model = get_model(
-        model_type,
-        model_name_or_path,
-        torch_dtype=torch_dtype,
-        model_max_length=model_max_length,
-        attn_impl=attn_impl,
-        cache_dir=cache_dir,
-        trust_remote_code=trust_remote_code,
-        additional_config=additional_config,
-    )
-
-    return model, tokenizer
-
-
 def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments)
@@ -429,10 +287,10 @@ def train():
     logger.info(f"data_args: {data_args}")
     logger.info(f"training_args: {training_args}")
 
-    model, tokenizer = get_model_and_tokenizer(
-        model_args.model_type,
-        model_args.model_name_or_path,
-        tokenizer_path=model_args.tokenizer_name_or_path,
+    # Load model and tokenizer using llamafactory
+    model, tokenizer = load_model_and_tokenizer(
+        model_name_or_path=model_args.model_name_or_path,
+        tokenizer_name_or_path=model_args.tokenizer_name_or_path,
         trust_remote_code=model_args.trust_remote_code,
         padding_side=model_args.padding_side,
         torch_dtype=model_args.torch_dtype,
@@ -441,17 +299,15 @@ def train():
         model_max_length=training_args.model_max_length,
         cache_dir=training_args.cache_dir,
     )
+
     # Freeze all parameters except gate if train_only_gate is True
     if training_args.train_only_gate:
         for name, param in model.named_parameters():
             if "gate" not in name:
                 param.requires_grad = False
-    # Freeze gate if freeze_gate is True
-    elif training_args.freeze_gate:
-        for name, param in model.named_parameters():
-            if "gate" in name:
-                param.requires_grad = False
+        logger.info("Only gate parameters are trainable.")
 
+    # Prepare dataset
     train_dataset = None
     datapath = pathlib.Path(data_args.dataset_dir_or_path)
     if not datapath.exists():
@@ -467,7 +323,8 @@ def train():
         raise ValueError(f"Unknown dataset path type: {datapath}")
     logger.info("train dataset ready")
 
-    trainer = Trainer(
+    # Initialize trainer using llamafactory's LLaMATrainer
+    trainer = LLaMATrainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
@@ -476,6 +333,7 @@ def train():
     )
     logger.info("trainer ready")
 
+    # Start training
     if training_args.do_train:
         if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
             logger.info("resume training from ckpt")
@@ -489,10 +347,7 @@ def train():
         logger.info("training finished, dumping model")
         model.config.use_cache = True
         trainer.save_state()
-        if trainer.is_deepspeed_enabled:
-            trainer.save_model()
-        else:
-            trainer_save_model_safe(trainer)
+        trainer.save_model()
 
     logger.info("🎉 All done~")
 
