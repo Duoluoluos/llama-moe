@@ -88,4 +88,6 @@ if __name__ == "__main__":
             jsonl_path=args.codata_path,
             save_path=args.save_path
         )
+    else:
+        raise ValueError("Please specify stage using --stage flag.")
     print("\nDone.")

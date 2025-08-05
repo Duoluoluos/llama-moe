@@ -7,21 +7,173 @@ References:
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator,Dict
 from datasets import Dataset as HFDataset
-
+from transformers import PreTrainedTokenizer
 import numpy as np
 import torch
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
+import transformers
+from smoe.utils.conversation import Conversation
 
 from smoe.data.aggregation import group_instances
 from smoe.utils.io import load_jsonlines, load_jsonlines_iter
 from smoe.utils.logging import get_logger
 from smoe.utils.random_utils import get_random_string
 from smoe.utils.vars import JSONL_DATASET_CACHE_NAME, META_SUFFIX
+from smoe.utils.io import load_json, load_jsonlines
+from transformers.trainer_pt_utils import LabelSmoother
 
 logger = get_logger(__file__)
+IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
+def preprocess(
+    instances,
+    tokenizer: transformers.PreTrainedTokenizer,
+) -> Dict:
+    tokenizer_legacy = getattr(tokenizer, "legacy", True)
+    conv = Conversation()
+    conv.sep2 = tokenizer.eos_token
+    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+
+    # Apply prompt templates
+    conversations = []
+    for i, ins in enumerate(instances):
+        conv.clear_msg()
+        sys_msg = ins.get("system_prompt", "")
+        conv.set_system_message(sys_msg)
+
+        # Check if data is in instruction/input/output format
+        if "instruction" in ins and "output" in ins:
+            # Handle instruction/input/output format
+            human_msg = ins["instruction"]
+            if "input" in ins and ins["input"]:
+                human_msg += f"\n{ins['input']}"
+            conv.append_message(roles["human"], human_msg)
+            conv.append_message(roles["gpt"], ins["output"])
+        elif "conversations" in ins and len(ins["conversations"]) > 0:
+            # Handle original conversations format
+            if roles[ins["conversations"][0]["from"]] != roles["human"]:
+                # Skip the first one if it is not from human
+                ins["conversations"] = ins["conversations"][1:]
+
+            for j, turn in enumerate(ins["conversations"]):
+                role = roles[turn["from"]]
+                assert role == conv.roles[j % 2], f"{i}/{j}"
+                conv.append_message(role, turn["value"])
+        else:
+            raise ValueError(f"Unsupported data format for instance {i}: {ins.keys()}")
+
+        conversations.append(conv.get_prompt())
+
+    # Tokenize conversations
+    res = tokenizer(
+        conversations,
+        return_tensors="pt",
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+    )
+    input_ids = res["input_ids"]
+    attention_masks = res["attention_mask"]
+    targets = input_ids.clone()
+
+    # Mask targets. Only compute loss on the assistant outputs.
+    sep = conv.sep + conv.roles[1] + ": "
+    # attention_masks = torch.ones_like(input_ids)
+    for conversation, target, attention_mask in zip(
+        conversations, targets, attention_masks
+    ):
+        turns = conversation.split(conv.sep2)
+        # the eos token is included in `total_len`, llama2 will add bos token
+        # total_len = int(target.ne(tokenizer.pad_token_id).sum()) + len(turns) * int(tokenizer.pad_token == tokenizer.eos_token)
+        # attention_mask[total_len:] = 0
+        total_len = attention_mask.sum()
+
+        cur_len = 0
+        has_bos = False
+        if target[0] == tokenizer.bos_token_id:
+            cur_len = 1
+            target[:cur_len] = IGNORE_TOKEN_ID  # bos token
+            has_bos = True
+        for i, turn in enumerate(turns):
+            if turn == "":
+                break
+            # +1: add sep2 token
+            turn_len = len(tokenizer(turn).input_ids) - int(has_bos) + 1
+
+            # sep: " ASSISTANT: "
+            parts = turn.split(sep)
+            if len(parts) != 2:
+                break
+            parts[0] += sep
+            # "-2" is hardcoded for the Llama tokenizer to make the offset correct: bos and the last space token
+            # -1 means remove extra suffix space in sep
+            instruction_len = len(tokenizer(parts[0]).input_ids) - int(has_bos) - 1
+
+            if i != 0 and not tokenizer_legacy:
+                # The legacy and non-legacy modes handle special tokens differently
+                instruction_len -= 1
+
+            # Ignore the user instructions
+            target[cur_len : cur_len + instruction_len] = IGNORE_TOKEN_ID
+            cur_len += turn_len
+            # if i < len(turns) - 1:
+            #     # plus one for sep2 token (eos)
+            #     cur_len += 1
+
+            if i != 0 and not tokenizer_legacy:
+                # The legacy and non-legacy modes handle special tokens differently
+                cur_len -= 1
+
+        target[cur_len:] = IGNORE_TOKEN_ID
+
+        if cur_len < tokenizer.model_max_length:
+            if cur_len != total_len:
+                target[:] = IGNORE_TOKEN_ID
+                logger.info(
+                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
+                    f" #turn = {len(turns) - 1}. (ignored)"
+                )
+
+    return dict(
+        input_ids=input_ids,
+        labels=targets,
+        attention_mask=attention_masks,
+    )
+
+class JsonDataset(Dataset):
+    def __init__(
+        self,
+        datapath: str,
+        tokenizer: PreTrainedTokenizer,
+        seed: int = 1227,
+    ) -> None:
+        super().__init__()
+        self.datapath = datapath
+        self.rng = random.Random(seed)
+        self.tokenizer = tokenizer
+        # Assumes the JSON file contains a list of dictionaries
+        self.data = load_json(datapath)
+        self.rng.shuffle(self.data)
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, index):
+        ins = self.data[index]
+        processed = preprocess([ins], self.tokenizer)
+        ins = {}
+        for key in processed:
+            ins[key] = processed[key][0]
+        return ins
+
+    def state_dict(self):
+        return {
+            "datapath": self.datapath,
+            "seed": self.seed,
+            "rng": self.rng.getstate(),
+        }
 
 def load_process_and_create_hf_dataset(block_size: int, filepath: Path, debug = False) -> HFDataset:
     """

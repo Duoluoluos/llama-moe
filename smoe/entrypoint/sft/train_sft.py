@@ -1,3 +1,8 @@
+import sys
+sys.path.append('.')
+#from smoe.utils import qwen2_hotfix
+from types import MethodType
+
 import math
 import pathlib
 import random
@@ -11,10 +16,13 @@ from loguru import logger
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, Trainer
 from transformers.trainer_pt_utils import LabelSmoother
-
+from smoe.data.streaming import JsonDataset, preprocess
 from smoe.utils.conversation import Conversation
 from smoe.utils.io import load_json, load_jsonlines
-
+from smoe.models.qwen_moe.modeling_qwen_moe import (
+    QwenMoEConfig,
+    QwenMoEForCausalLM,
+)
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
 
@@ -41,12 +49,6 @@ class ModelArguments:
     additional_config: str = field(
         default=None,
         metadata={"help": "Additional config file (in json) to load"},
-    )
-    attn_impl: str = field(
-        default="flash_attention_2",
-        metadata={
-            "help": "attention implementation, choice from [eager, flash_attention_2, sdpa] (default: `flash_attention_2`)"
-        },
     )
 
     def __post_init__(self):
@@ -107,120 +109,6 @@ def trainer_save_model_safe(trainer):
         trainer.save_model()
 
 
-def preprocess(
-    instances,
-    tokenizer: transformers.PreTrainedTokenizer,
-) -> Dict:
-    tokenizer_legacy = getattr(tokenizer, "legacy", True)
-    conv = Conversation()
-    conv.sep2 = tokenizer.eos_token
-    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
-
-    # Apply prompt templates
-    conversations = []
-    for i, ins in enumerate(instances):
-        conv.clear_msg()
-        sys_msg = ins.get("system_prompt", "")
-        conv.set_system_message(sys_msg)
-
-        # Check if data is in instruction/input/output format
-        if "instruction" in ins and "output" in ins:
-            # Handle instruction/input/output format
-            human_msg = ins["instruction"]
-            if "input" in ins and ins["input"]:
-                human_msg += f"\n{ins['input']}"
-            conv.append_message(roles["human"], human_msg)
-            conv.append_message(roles["gpt"], ins["output"])
-        elif "conversations" in ins and len(ins["conversations"]) > 0:
-            # Handle original conversations format
-            if roles[ins["conversations"][0]["from"]] != roles["human"]:
-                # Skip the first one if it is not from human
-                ins["conversations"] = ins["conversations"][1:]
-
-            for j, turn in enumerate(ins["conversations"]):
-                role = roles[turn["from"]]
-                assert role == conv.roles[j % 2], f"{i}/{j}"
-                conv.append_message(role, turn["value"])
-        else:
-            raise ValueError(f"Unsupported data format for instance {i}: {ins.keys()}")
-
-        conversations.append(conv.get_prompt())
-
-    # Tokenize conversations
-    res = tokenizer(
-        conversations,
-        return_tensors="pt",
-        padding="max_length",
-        max_length=tokenizer.model_max_length,
-        truncation=True,
-    )
-    input_ids = res["input_ids"]
-    attention_masks = res["attention_mask"]
-    targets = input_ids.clone()
-
-    # Mask targets. Only compute loss on the assistant outputs.
-    sep = conv.sep + conv.roles[1] + ": "
-    # attention_masks = torch.ones_like(input_ids)
-    for conversation, target, attention_mask in zip(
-        conversations, targets, attention_masks
-    ):
-        turns = conversation.split(conv.sep2)
-        # the eos token is included in `total_len`, llama2 will add bos token
-        # total_len = int(target.ne(tokenizer.pad_token_id).sum()) + len(turns) * int(tokenizer.pad_token == tokenizer.eos_token)
-        # attention_mask[total_len:] = 0
-        total_len = attention_mask.sum()
-
-        cur_len = 0
-        has_bos = False
-        if target[0] == tokenizer.bos_token_id:
-            cur_len = 1
-            target[:cur_len] = IGNORE_TOKEN_ID  # bos token
-            has_bos = True
-        for i, turn in enumerate(turns):
-            if turn == "":
-                break
-            # +1: add sep2 token
-            turn_len = len(tokenizer(turn).input_ids) - int(has_bos) + 1
-
-            # sep: " ASSISTANT: "
-            parts = turn.split(sep)
-            if len(parts) != 2:
-                break
-            parts[0] += sep
-            # "-2" is hardcoded for the Llama tokenizer to make the offset correct: bos and the last space token
-            # -1 means remove extra suffix space in sep
-            instruction_len = len(tokenizer(parts[0]).input_ids) - int(has_bos) - 1
-
-            if i != 0 and not tokenizer_legacy:
-                # The legacy and non-legacy modes handle special tokens differently
-                instruction_len -= 1
-
-            # Ignore the user instructions
-            target[cur_len : cur_len + instruction_len] = IGNORE_TOKEN_ID
-            cur_len += turn_len
-            # if i < len(turns) - 1:
-            #     # plus one for sep2 token (eos)
-            #     cur_len += 1
-
-            if i != 0 and not tokenizer_legacy:
-                # The legacy and non-legacy modes handle special tokens differently
-                cur_len -= 1
-
-        target[cur_len:] = IGNORE_TOKEN_ID
-
-        if cur_len < tokenizer.model_max_length:
-            if cur_len != total_len:
-                target[:] = IGNORE_TOKEN_ID
-                logger.info(
-                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
-                    f" #turn = {len(turns) - 1}. (ignored)"
-                )
-
-    return dict(
-        input_ids=input_ids,
-        labels=targets,
-        attention_mask=attention_masks,
-    )
 
 
 def fault_tolerance_data_collator(features: list) -> dict[str, Any]:
@@ -287,37 +175,7 @@ def fault_tolerance_data_collator(features: list) -> dict[str, Any]:
     return batch
 
 
-class CachedJsonlDataset(Dataset):
-    def __init__(
-        self,
-        datapath: str,
-        tokenizer: PreTrainedTokenizer,
-        seed: int = 1227,
-    ) -> None:
-        super().__init__()
-        self.datapath = datapath
-        self.rng = random.Random(seed)
-        self.tokenizer = tokenizer
-        self.data = load_jsonlines(datapath)
-        self.rng.shuffle(self.data)
 
-    def __len__(self) -> int:
-        return len(self.data)
-
-    def __getitem__(self, index):
-        ins = self.data[index]
-        processed = preprocess([ins], self.tokenizer)
-        ins = {}
-        for key in processed:
-            ins[key] = processed[key][0]
-        return ins
-
-    def state_dict(self):
-        return {
-            "datapath": self.datapath,
-            "seed": self.seed,
-            "rng": self.rng.getstate(),
-        }
 
 
 def get_tokenizer(
@@ -350,17 +208,19 @@ def get_model(
     model_name_or_path: str,
     torch_dtype: str = "auto",
     model_max_length: int = 2048,
-    attn_impl: str = "flash_attention_2",
     cache_dir: str = None,
     trust_remote_code: bool = False,
     additional_config: dict = None,
 ):
     logger.info(f"Model type: {model_type}")
-    if model_type == "auto":
+    if model_type == "qwen":
+        ConfigClass = QwenMoEConfig
+        ModelClass = QwenMoEForCausalLM
+    elif model_type == "auto":
         ConfigClass = transformers.AutoConfig
         ModelClass = transformers.AutoModelForCausalLM
     else:
-        raise ValueError(f"Unknown model type: {model_type}")
+        raise NotImplementedError
 
     # Set RoPE scaling factor
     config = ConfigClass.from_pretrained(
@@ -383,8 +243,7 @@ def get_model(
         config=config,
         cache_dir=cache_dir,
         torch_dtype=torch_dtype,
-        trust_remote_code=trust_remote_code,
-        attn_implementation=attn_impl,
+        trust_remote_code=trust_remote_code
     )
     logger.info("model ready")
 
@@ -397,7 +256,6 @@ def get_model_and_tokenizer(
     tokenizer_path: str = None,
     torch_dtype: str = "auto",
     model_max_length: int = 2048,
-    attn_impl: str = "flash_attention_2",
     cache_dir: str = None,
     trust_remote_code: bool = False,
     padding_side: str = "right",
@@ -406,6 +264,7 @@ def get_model_and_tokenizer(
 ) -> tuple:
     if tokenizer_path is None:
         tokenizer_path = model_name_or_path
+    print(f"load tokenizer from {tokenizer_path}")
     tokenizer = get_tokenizer(
         tokenizer_path,
         cache_dir=cache_dir,
@@ -419,7 +278,6 @@ def get_model_and_tokenizer(
         model_name_or_path,
         torch_dtype=torch_dtype,
         model_max_length=model_max_length,
-        attn_impl=attn_impl,
         cache_dir=cache_dir,
         trust_remote_code=trust_remote_code,
         additional_config=additional_config,
@@ -448,20 +306,18 @@ def train():
         padding_side=model_args.padding_side,
         torch_dtype=model_args.torch_dtype,
         additional_config=model_args.additional_config,
-        attn_impl=model_args.attn_impl,
         model_max_length=training_args.model_max_length,
         cache_dir=training_args.cache_dir,
     )
     # Freeze all parameters except gate if train_only_gate is True
     if training_args.train_only_gate:
-        for name, param in model.named_parameters():
-            if "gate" not in name:
-                param.requires_grad = False
-    # Freeze gate if freeze_gate is True
-    elif training_args.freeze_gate:
-        for name, param in model.named_parameters():
-            if "gate" in name:
-                param.requires_grad = False
+        for n,p in model.named_parameters():
+            if "gate" in n or "lm_head" in n:
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+    n_trainable = sum(p.requires_grad for p in model.parameters())
+    logger.info(f"n_trainable: {n_trainable}")
 
     train_dataset = None
     datapath = pathlib.Path(data_args.dataset_dir_or_path)
@@ -469,7 +325,7 @@ def train():
         raise ValueError(f"Dataset path {datapath} not found")
     elif datapath.is_file():
         logger.info(f"CachedJsonlDataset: {datapath}")
-        train_dataset = CachedJsonlDataset(
+        train_dataset = JsonDataset(
             data_args.dataset_dir_or_path,
             tokenizer,
             seed=training_args.seed,
@@ -486,7 +342,25 @@ def train():
         data_collator=fault_tolerance_data_collator,
     )
     logger.info("trainer ready")
+    # def debug_compute_loss(self, model, inputs, *args, **kwargs):
+    #     """
+    #     与原 compute_loss 保持同样的可变形参，以便向后兼容。
+    #     """
+    #     # 调用模型 → forward
+    #     outputs = model(**inputs)
 
+    #     # 兼容 ModelOutput / tuple 两种返回格式
+    #     if isinstance(outputs, dict):
+    #         loss = outputs["loss"]
+    #     else:
+    #         loss = outputs[0]          # tuple 形式 (loss, logits, ...)
+    #     print(">>> loss.requires_grad:", loss.requires_grad,
+    #         "grad_fn:", loss.grad_fn)
+
+    #     # 保持 Trainer 流程一致
+    #     return (loss, outputs) if kwargs.get("return_outputs", False) else loss
+
+    # trainer.compute_loss = MethodType(debug_compute_loss, trainer)
     if training_args.do_train:
         if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
             logger.info("resume training from ckpt")
@@ -502,8 +376,8 @@ def train():
         trainer.save_state()
         if trainer.is_deepspeed_enabled:
             trainer.save_model()
-        else:
-            trainer_save_model_safe(trainer)
+        # else:
+        #     trainer_save_model_safe(trainer)
 
     logger.info("🎉 All done~")
 
